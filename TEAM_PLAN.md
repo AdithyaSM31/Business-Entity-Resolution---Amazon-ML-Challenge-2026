@@ -39,7 +39,7 @@ Rule: while a dependency is not ready, build against its v0 or a stub. Nobody wa
 ### Adithya: Models & GPU (lead)
 **Day 1 (25 Sep)**
 - [ ] AD-1 Push this scaffold; get everyone cloned and installed before kickoff.
-- [ ] AD-2 `embeddings.py`: encode all records with pretrained `intfloat/multilingual-e5-small` (MIT) on the GPU (`"query: {name_core} | {addr_norm}"` plus a name-only variant). Run FAISS top-K within country (S1→S2, S1→S3 and reverse) and hand `dense_neighbors_{split}.parquet` to Siva. Add `fm_emb_cos` features.
+- [ ] AD-2 `embeddings.py`: encode all records with pretrained `intfloat/multilingual-e5-small` (MIT) on the GPU (`"query: {name_core} | {addr_norm}"` plus a name-only variant). Run an exact top-K search within country (S1→S2, S1→S3 and reverse) and hand `dense_neighbors_{split}.parquet` to Siva. Add `fm_emb_cos` features.
 - [ ] AD-3 `train.py` / `predict.py`: stage-1 LightGBM on `folds.parquet`, early stopping, out-of-fold predictions, feature importance. First run on blocking scores + whatever pair features exist.
 - [ ] AD-4 First real model → submission #2.
 
