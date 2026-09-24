@@ -1,34 +1,44 @@
 """Dense embeddings: dense blocking pass and embedding-similarity features. Owner: Adithya (AD-2, AD-5). GPU.
 
 Model: intfloat/multilingual-e5-small (MIT); every text is prefixed with "query: " (symmetric matching).
+It is multilingual, so it can link Devanagari / Kannada names to their Latin spellings, which
+character n-gram TF-IDF cannot.
 Two views per record: "{tag}" = name + address, "{tag}-name" = name only.
-Outputs:
-  cache/emb/{tag}_{split}.npy                 float16, L2-normalized, row i = cache/emb/{tag}_{split}_ids.parquet row i
+
+Outputs (per split; rows ordered by source, then country, so every (source, country) block is contiguous):
+  cache/emb/{tag}_{split}.npy                 float16 memmap, L2-normalized, row i = row i of the ids file
+  cache/emb/{tag}_{split}_ids.parquet         source, entity_id, country
   cache/emb/dense_neighbors_{split}.parquet   s1_id, cand_id, score  (the dense pass, handed to Siva)
   cache/feat_model_{split}.parquet            s1_id, cand_id, fm_emb_cos, fm_emb_name_cos, ...
+On train, the neighbour search only queries the S1 entities in the dev sample (config.SAMPLE_FRAC);
+the S2/S3 pools and every test S1 are always complete.
 The fine-tuned model (AD-5) is trained 2-fold by S1 so that fm_* features on train stay out-of-fold;
 a model fine-tuned on all of train encodes test.
 
 Usage:
-  python -m src.embeddings encode              # both views, both splits
-  python -m src.embeddings neighbors --k 20    # dense pass for Siva
-  python -m src.embeddings features            # fm_* columns for every candidate file that exists
+  python -m src.embeddings encode [--views full name]
+  python -m src.embeddings neighbors --k 10 --k-reverse 3 --max-per-s1 30
+  python -m src.embeddings features
   python -m src.embeddings all
 """
 import argparse
+import json
 import time
 import unicodedata
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from . import config, io_utils
 
-# torch is imported only inside _load_model: on Windows, torch and faiss bundle different OpenMP
-# runtimes that abort when both load in one process, so the neighbour search below is plain numpy.
+# torch is imported lazily: on Windows, torch and faiss bundle different OpenMP runtimes that abort
+# when both load in one process, so nothing here uses faiss.
 
 DEFAULT_MODEL = "intfloat/multilingual-e5-small"
 DEFAULT_TAG = "e5s"
+ENCODE_CHUNK = 200_000  # rows encoded and flushed to disk at a time (also the resume granularity)
 
 
 def _log(msg: str) -> None:
@@ -36,26 +46,40 @@ def _log(msg: str) -> None:
 
 
 def _basic_clean(text: str) -> str:
-    """Fallback cleanup used only while cache/records.parquet (Bhanu, BH-2) does not exist yet."""
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower().replace("&", " and ")
-    text = "".join(ch if ch.isalnum() else " " for ch in text)
-    return " ".join(text.split())
+    """Fallback cleanup used only while cache/records.parquet (Bhanu, BH-2) does not exist yet.
+
+    Accents are stripped only from Latin letters: Devanagari and Kannada vowel signs are marks too
+    (Unicode category M*), and dropping them would corrupt those names.
+    """
+    out = []
+    for ch in unicodedata.normalize("NFKD", text.lower().replace("&", " and ")):
+        is_mark = unicodedata.category(ch).startswith("M")
+        if is_mark and out and out[-1].isascii():
+            continue
+        out.append(ch if ch.isalnum() or is_mark else " ")
+    return " ".join("".join(out).split())
 
 
-def load_records() -> pd.DataFrame:
-    """Records with split, source, entity_id, country, name_core, addr_norm."""
+def load_records(split: str) -> pd.DataFrame:
+    """One split's records with source, entity_id, country, name_core, addr_norm, sorted by (source, country)."""
     path = config.CACHE_DIR / "records.parquet"
+    cols = ["source", "entity_id", "country", "name_core", "addr_norm"]
     if path.exists():
-        rec = pd.read_parquet(path, columns=["split", "source", "entity_id", "country", "name_core", "addr_norm"])
+        rec = pd.read_parquet(path, columns=cols, filters=[("split", "==", split)])
     else:
-        _log("cache/records.parquet not found; using basic cleanup of the raw files until BH-2 lands")
-        rec = io_utils.read_all_records()
-        rec["name_core"] = rec["business_name"].map(_basic_clean)
-        rec["addr_norm"] = rec["business_address"].map(_basic_clean)
-        rec = rec[["split", "source", "entity_id", "country", "name_core", "addr_norm"]]
+        _log(f"cache/records.parquet not found; basic cleanup of the raw {split} files until BH-2 lands")
+        parts = []
+        for source in config.SOURCES:
+            df = io_utils.read_source(split, source)
+            parts.append(pd.DataFrame({
+                "source": np.int8(source), "entity_id": df["entity_id"], "country": df["country"],
+                "name_core": df["business_name"].map(_basic_clean),
+                "addr_norm": df["business_address"].map(_basic_clean),
+            }))
+            del df
+        rec = pd.concat(parts, ignore_index=True)
     rec["country"] = rec["country"].str.strip()
-    return rec
+    return rec.sort_values(["source", "country", "entity_id"], kind="stable").reset_index(drop=True)
 
 
 def _texts(rec: pd.DataFrame, view: str) -> list[str]:
@@ -76,115 +100,165 @@ def _load_model(model_name: str):
     return model
 
 
-def encode_records(tag: str = DEFAULT_TAG, model_name: str = DEFAULT_MODEL, batch_size: int = 256) -> None:
-    """Encode every record of both splits in two views; saves {tag}_{split}.npy and {tag}-name_{split}.npy."""
-    rec = load_records()
+def encode_records(tag: str = DEFAULT_TAG, model_name: str = DEFAULT_MODEL, views=("full", "name"),
+                   batch_size: int = 1024) -> None:
+    """Encode every record of both splits; resumable (re-running continues after the last finished chunk)."""
     model = _load_model(model_name)
-    for view, view_tag, max_len in (("full", tag, 128), ("name", f"{tag}-name", 48)):
-        model.max_seq_length = max_len
-        for split in config.SPLITS:
-            part = rec[rec["split"] == split].reset_index(drop=True)
+    dim = model.get_sentence_embedding_dimension()
+    for split in config.SPLITS:
+        rec = load_records(split)
+        for view in views:
+            view_tag = tag if view == "full" else f"{tag}-{view}"
+            model.max_seq_length = 64 if view == "full" else 32
+            emb_path = config.cache_path(f"emb/{view_tag}_{split}.npy")
+            ids_path = config.cache_path(f"emb/{view_tag}_{split}_ids.parquet")
+            prog_path = config.cache_path(f"emb/{view_tag}_{split}.progress.json")
+            done = json.loads(prog_path.read_text())["rows_done"] if prog_path.exists() and emb_path.exists() else 0
+            if done == 0:
+                rec[["source", "entity_id", "country"]].to_parquet(ids_path, index=False)
+                emb = np.lib.format.open_memmap(emb_path, mode="w+", dtype=np.float16, shape=(len(rec), dim))
+            else:
+                emb = np.load(emb_path, mmap_mode="r+")
+            if done >= len(rec):
+                _log(f"{view_tag} {split}: already complete ({len(rec):,} rows)")
+                continue
             t0 = time.time()
-            emb = model.encode(_texts(part, view), batch_size=batch_size, normalize_embeddings=True,
-                               convert_to_numpy=True, show_progress_bar=False)
-            np.save(config.cache_path(f"emb/{view_tag}_{split}.npy"), emb.astype(np.float16))
-            part[["source", "entity_id"]].to_parquet(config.cache_path(f"emb/{view_tag}_{split}_ids.parquet"), index=False)
-            _log(f"{view_tag} {split}: {len(part):,} records, dim {emb.shape[1]}, {time.time() - t0:.1f}s")
+            for start in range(done, len(rec), ENCODE_CHUNK):
+                part = rec.iloc[start:start + ENCODE_CHUNK]
+                emb[start:start + len(part)] = model.encode(
+                    _texts(part, view), batch_size=batch_size, normalize_embeddings=True,
+                    convert_to_numpy=True, show_progress_bar=False).astype(np.float16)
+                emb.flush()
+                prog_path.write_text(json.dumps({"rows_done": start + len(part)}))
+                rate = (start + len(part) - done) / (time.time() - t0)
+                _log(f"{view_tag} {split}: {start + len(part):,}/{len(rec):,} rows, {rate:,.0f}/s, "
+                     f"eta {(len(rec) - start - len(part)) / rate / 60:.0f} min")
+            del emb
+        del rec
 
 
 def load_embeddings(tag: str, split: str) -> tuple[np.ndarray, pd.DataFrame]:
-    emb = np.load(config.cache_path(f"emb/{tag}_{split}.npy")).astype(np.float32)
+    """Memory-mapped float16 embeddings and their ids (source, entity_id, country)."""
+    emb = np.load(config.cache_path(f"emb/{tag}_{split}.npy"), mmap_mode="r")
     ids = pd.read_parquet(config.cache_path(f"emb/{tag}_{split}_ids.parquet"))
     return emb, ids
 
 
-def _topk(queries: np.ndarray, pool: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Exact inner-product top-k (vectors are L2-normalized, so this is cosine), sorted best first.
+def _topk(queries: np.ndarray, pool: np.ndarray, k: int, q_chunk: int = 1024,
+          p_chunk: int = 400_000) -> tuple[np.ndarray, np.ndarray]:
+    """Exact top-k by inner product (= cosine for normalized vectors), best first. GPU when available."""
+    import torch
 
-    Queries are processed in chunks so the score block stays around 200 MB.
-    """
     k = min(k, len(pool))
-    chunk = max(1, int(5e7 // len(pool)))
-    all_scores, all_idx = [], []
-    for start in range(0, len(queries), chunk):
-        scores = queries[start:start + chunk] @ pool.T
-        idx = np.argpartition(-scores, k - 1, axis=1)[:, :k]
-        top = np.take_along_axis(scores, idx, axis=1)
-        order = np.argsort(-top, axis=1)
-        all_idx.append(np.take_along_axis(idx, order, axis=1))
-        all_scores.append(np.take_along_axis(top, order, axis=1))
-    return np.vstack(all_scores), np.vstack(all_idx)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    pool_t = torch.from_numpy(np.ascontiguousarray(pool)).to(device, dtype)
+    out_s = np.empty((len(queries), k), dtype=np.float32)
+    out_i = np.empty((len(queries), k), dtype=np.int64)
+    with torch.inference_mode():
+        for qs in range(0, len(queries), q_chunk):
+            q = torch.from_numpy(np.ascontiguousarray(queries[qs:qs + q_chunk])).to(device, dtype)
+            best_s = best_i = None
+            for ps in range(0, len(pool_t), p_chunk):
+                s, i = (q @ pool_t[ps:ps + p_chunk].T).topk(min(k, len(pool_t) - ps), dim=1)
+                i += ps
+                if best_s is not None:
+                    s, j = torch.cat([best_s, s], 1).topk(k, dim=1)
+                    i = torch.cat([best_i, i], 1).gather(1, j)
+                best_s, best_i = s, i
+            out_s[qs:qs + len(q)] = best_s.float().cpu().numpy()
+            out_i[qs:qs + len(q)] = best_i.cpu().numpy()
+    del pool_t
+    return out_s, out_i
 
 
-def dense_neighbors(split: str, tag: str = DEFAULT_TAG, k: int = 20, k_reverse: int = 5) -> pd.DataFrame:
+def _blocks(ids: pd.DataFrame) -> dict[tuple[int, str], np.ndarray]:
+    """Row positions of every (source, country) block; contiguous because the files are sorted."""
+    return dict(ids.groupby(["source", "country"]).indices)
+
+
+def dense_neighbors(split: str, tag: str = DEFAULT_TAG, k: int = 10, k_reverse: int = 3,
+                    max_per_s1: int = 30) -> None:
     """Dense blocking pass: S1->S2 and S1->S3 top-k plus the reverse top-k_reverse, within country.
 
-    Countries come from the data (open set). If a country has fewer than k target records,
-    the S1 records of that country search the whole target pool of the split instead.
+    Countries come from the data (open set). If a country has fewer than k target records, its S1
+    records search the whole target pool of the split. The union is capped at max_per_s1 per S1.
     """
     emb, ids = load_embeddings(tag, split)
-    rec = load_records()
-    country = ids.merge(rec[rec["split"] == split][["source", "entity_id", "country"]],
-                        on=["source", "entity_id"], how="left")["country"].fillna("").to_numpy()
-    source = ids["source"].to_numpy()
-    entity = ids["entity_id"].to_numpy()
+    blocks = _blocks(ids)
+    entity = pa.array(ids["entity_id"].to_numpy())
 
-    s1_mask = source == 1
-    if config.SAMPLE_FRAC < 1:
-        s1_mask &= np.array([io_utils.in_dev_sample(e) for e in entity])
+    s1_rows = np.where(ids["source"].to_numpy() == 1)[0]
+    if split == "train" and config.SAMPLE_FRAC < 1:
+        keep = np.fromiter((io_utils.in_dev_sample(e) for e in ids["entity_id"].to_numpy()[s1_rows]),
+                           dtype=bool, count=len(s1_rows))
+        s1_rows = s1_rows[keep]
+    s1_country = ids["country"].to_numpy()[s1_rows]
 
-    parts = []
+    q_parts, c_parts, s_parts = [], [], []
+    t0 = time.time()
     for target in (2, 3):
-        t_mask = source == target
-        for c in np.unique(country[s1_mask]):
-            q_idx = np.where(s1_mask & (country == c))[0]
-            p_idx = np.where(t_mask & (country == c))[0]
-            if len(p_idx) < k:
-                p_idx = np.where(t_mask)[0]
-            if len(q_idx) == 0 or len(p_idx) == 0:
+        all_target = np.where(ids["source"].to_numpy() == target)[0]
+        for country in np.unique(s1_country):
+            q_rows = s1_rows[s1_country == country]
+            p_rows = blocks.get((target, country), np.empty(0, dtype=np.int64))
+            if len(p_rows) < k:
+                p_rows = all_target
+            if len(q_rows) == 0 or len(p_rows) == 0:
                 continue
-            # S1 -> target
-            scores, nn = _topk(emb[q_idx], emb[p_idx], k)
-            parts.append(pd.DataFrame({"s1_id": np.repeat(entity[q_idx], nn.shape[1]),
-                                       "cand_id": entity[p_idx][nn.ravel()], "score": scores.ravel()}))
-            # target -> S1 (reverse): catches records whose own best S1 is outside that S1's top-k
-            r_idx = np.where(t_mask & (country == c))[0]
-            if len(r_idx):
-                scores, nn = _topk(emb[r_idx], emb[q_idx], k_reverse)
-                parts.append(pd.DataFrame({"s1_id": entity[q_idx][nn.ravel()],
-                                           "cand_id": np.repeat(entity[r_idx], nn.shape[1]), "score": scores.ravel()}))
+            scores, nn = _topk(emb[q_rows], emb[p_rows], k)
+            q_parts.append(np.repeat(q_rows, nn.shape[1]))
+            c_parts.append(p_rows[nn.ravel()])
+            s_parts.append(scores.ravel())
+            # reverse: each target record's closest S1s, which catches matches ranked below k from the S1 side
+            r_rows = blocks.get((target, country), np.empty(0, dtype=np.int64))
+            if len(r_rows) and k_reverse > 0:
+                scores, nn = _topk(emb[r_rows], emb[q_rows], k_reverse)
+                q_parts.append(q_rows[nn.ravel()])
+                c_parts.append(np.repeat(r_rows, nn.shape[1]))
+                s_parts.append(scores.ravel())
+            _log(f"{split} S1->S{target} {country}: {len(q_rows):,} queries x {len(p_rows):,} pool, "
+                 f"{time.time() - t0:.0f}s elapsed")
 
-    out = (pd.concat(parts, ignore_index=True)
-           .sort_values("score", ascending=False)
-           .drop_duplicates(["s1_id", "cand_id"])
-           .reset_index(drop=True))
-    out["score"] = out["score"].astype(np.float32)
-    out.to_parquet(config.cache_path(f"emb/dense_neighbors_{split}.parquet"), index=False)
-    _log(f"dense neighbors {split}: {out['s1_id'].nunique():,} S1, {len(out):,} pairs, "
-         f"{len(out) / max(out['s1_id'].nunique(), 1):.1f} per S1")
+    pairs = pd.DataFrame({"q": np.concatenate(q_parts), "c": np.concatenate(c_parts),
+                          "score": np.concatenate(s_parts).astype(np.float32)})
+    del q_parts, c_parts, s_parts
+    pairs = (pairs.sort_values(["q", "score"], ascending=[True, False])
+             .drop_duplicates(["q", "c"]))
+    pairs = pairs[pairs.groupby("q").cumcount() < max_per_s1]
+    table = pa.table({"s1_id": entity.take(pa.array(pairs["q"].to_numpy())),
+                      "cand_id": entity.take(pa.array(pairs["c"].to_numpy())),
+                      "score": pa.array(pairs["score"].to_numpy())})
+    pq.write_table(table, config.cache_path(f"emb/dense_neighbors_{split}.parquet"))
+    n_s1 = pairs["q"].nunique()
+    _log(f"dense neighbors {split}: {n_s1:,} S1, {len(pairs):,} pairs, {len(pairs) / max(n_s1, 1):.1f} per S1, "
+         f"{time.time() - t0:.0f}s")
     if split == "train":
-        _report_recall(out)
-    return out
+        _report_recall(table.select(["s1_id", "cand_id"]).to_pandas(), set(ids["entity_id"].to_numpy()[s1_rows]))
 
 
-def _report_recall(pairs: pd.DataFrame) -> None:
-    """Share of ground-truth pairs found by the dense pass (train only)."""
-    gt = io_utils.read_ground_truth().explode("matches").dropna()
-    gt = gt[gt["s1_id"].isin(pairs["s1_id"].unique())]
-    if gt.empty:
-        return
-    found = gt.merge(pairs, left_on=["s1_id", "matches"], right_on=["s1_id", "cand_id"], how="left")["score"].notna()
-    by_src = found.groupby(gt["matches"].str[:2].to_numpy()).mean()
-    _log(f"dense pass pair recall on train: {found.mean():.4f} "
-         + " ".join(f"{s}={r:.4f}" for s, r in by_src.items()))
+def _report_recall(pairs: pd.DataFrame, s1_ids: set) -> None:
+    """Share of ground-truth pairs found, over the S1 entities that were queried (train only)."""
+    gt = io_utils.read_ground_truth()
+    gt = gt[gt["s1_id"].isin(s1_ids)].explode("matches").dropna().rename(columns={"matches": "cand_id"})
+    found = gt.merge(pairs.assign(hit=True), on=["s1_id", "cand_id"], how="left")["hit"].fillna(False).to_numpy()
+    src = gt["cand_id"].str[:2].to_numpy()
+    by_src = " ".join(f"{s}={found[src == s].mean():.4f}" for s in ("S2", "S3"))
+    _log(f"dense pass pair recall on train: {found.mean():.4f} ({by_src}) over {len(gt):,} true pairs")
 
 
-def _pair_cosine(pairs: pd.DataFrame, tag: str, split: str) -> np.ndarray:
+def _pair_cosine(pairs: pd.DataFrame, tag: str, split: str, chunk: int = 2_000_000) -> np.ndarray:
     emb, ids = load_embeddings(tag, split)
-    row = pd.Series(np.arange(len(ids)), index=ids["entity_id"].to_numpy())
-    a = emb[row.loc[pairs["s1_id"].to_numpy()].to_numpy()]
-    b = emb[row.loc[pairs["cand_id"].to_numpy()].to_numpy()]
-    return np.einsum("ij,ij->i", a, b).astype(np.float32)
+    index = pd.Index(ids["entity_id"].to_numpy())
+    a_rows, b_rows = index.get_indexer(pairs["s1_id"]), index.get_indexer(pairs["cand_id"])
+    if (a_rows < 0).any() or (b_rows < 0).any():
+        raise KeyError(f"{tag} {split}: some candidate ids have no embedding")
+    out = np.empty(len(pairs), dtype=np.float32)
+    for s in range(0, len(pairs), chunk):
+        a = emb[a_rows[s:s + chunk]].astype(np.float32)
+        b = emb[b_rows[s:s + chunk]].astype(np.float32)
+        out[s:s + chunk] = np.einsum("ij,ij->i", a, b)
+    return out
 
 
 def build_model_features(split: str, tag: str = DEFAULT_TAG) -> pd.DataFrame:
@@ -195,7 +269,8 @@ def build_model_features(split: str, tag: str = DEFAULT_TAG) -> pd.DataFrame:
     cands = pd.read_parquet(config.cache_path(f"candidates_{split}.parquet"), columns=["s1_id", "cand_id"])
     feats = cands.copy()
     feats["fm_emb_cos"] = _pair_cosine(cands, tag, split)
-    feats["fm_emb_name_cos"] = _pair_cosine(cands, f"{tag}-name", split)
+    if config.cache_path(f"emb/{tag}-name_{split}.npy").exists():
+        feats["fm_emb_name_cos"] = _pair_cosine(cands, f"{tag}-name", split)
     path = config.cache_path(f"feat_model_{split}.parquet")
     if path.exists():
         old = pd.read_parquet(path)
@@ -217,16 +292,18 @@ if __name__ == "__main__":
     parser.add_argument("step", choices=["encode", "neighbors", "features", "all"])
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--tag", default=DEFAULT_TAG)
-    parser.add_argument("--k", type=int, default=20)
-    parser.add_argument("--k-reverse", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--views", nargs="+", default=["full", "name"], choices=["full", "name"])
+    parser.add_argument("--k", type=int, default=10, help="neighbours per S1 per target source")
+    parser.add_argument("--k-reverse", type=int, default=3, help="S1 neighbours per S2/S3 record")
+    parser.add_argument("--max-per-s1", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=1024)
     args = parser.parse_args()
 
     if args.step in ("encode", "all"):
-        encode_records(args.tag, args.model, args.batch_size)
+        encode_records(args.tag, args.model, args.views, args.batch_size)
     if args.step in ("neighbors", "all"):
         for split in config.SPLITS:
-            dense_neighbors(split, args.tag, args.k, args.k_reverse)
+            dense_neighbors(split, args.tag, args.k, args.k_reverse, args.max_per_s1)
     if args.step in ("features", "all"):
         for split in config.SPLITS:
             if config.cache_path(f"candidates_{split}.parquet").exists():
