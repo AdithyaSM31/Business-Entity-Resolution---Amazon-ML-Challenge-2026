@@ -14,10 +14,11 @@ Step-by-step playbooks with AI-assistant prompts for Bhanu, Siva and Arushi are 
 | Singletons | 5.6% of S1; most S1 have 2–5 matches, some 8+ | Arushi |
 | Exclusivity | no S2/S3 ID belongs to two S1s | Arushi |
 | Country | 100% of true pairs share the country string | Siva |
-| Same-source duplicates | 81% of S1 have 2+ matches inside one source | Siva, Bhanu |
+| Same-source duplicates | 77% of all S1 (81% of S1 that have any match) have 2+ matches inside one source | Siva, Bhanu |
+| Address placeholders | ~3.3% of S2/S3 addresses contain a literal `NULL` / `<NULL>` / `null` component, on top of the 3.4% that are empty | Bhanu |
 | Distractors | 26% of S2 and 25% of S3 records match nothing | everyone |
 | Empty addresses | 3.4% of S2/S3, none in S1 | Bhanu |
-| Scripts | Devanagari names in India S2/S3, Kannada state names: never strip marks from non-Latin letters | Bhanu, Siva |
+| Scripts | Devanagari names in India S2/S3; Kannada and Malayalam state names in addresses (possibly more Indic scripts): never strip marks from non-Latin letters | Bhanu, Siva |
 | Name noise | junk prefixes (`-- `, `<< `), legal words at the front (`LLC Moncada …`), web domains as names, typos | Bhanu |
 | Address noise | UPPERCASE, reordered components, `5 bis Rue …` in France | Bhanu |
 | Dense pass (AD-2, done) | 95.8% pair recall on the train sample at ~29 candidates per S1; test 43.0M pairs, every S1 covered | Siva |
