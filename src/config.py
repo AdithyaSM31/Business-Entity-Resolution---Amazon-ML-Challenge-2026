@@ -19,9 +19,10 @@ SOURCES = (1, 2, 3)
 SEED = 42
 N_FOLDS = 5
 
-# Fraction of Source 1 entities kept for quick development on laptops without a GPU.
-# Anything submitted or logged in docs/experiments.csv must use 1.0.
-SAMPLE_FRAC = float(os.environ.get("BER_SAMPLE_FRAC", "1.0"))
+# Fraction of TRAIN Source 1 entities we work with (io_utils.in_dev_sample). The full train set
+# (2.2M S1, 7.6M true pairs) is too big for laptops, so the team trains on this fixed 20% sample
+# (440,555 S1). S2/S3 pools are never sampled, and test is never sampled.
+SAMPLE_FRAC = float(os.environ.get("BER_SAMPLE_FRAC", "0.2"))
 N_JOBS = int(os.environ.get("BER_N_JOBS", str(os.cpu_count() or 4)))
 
 

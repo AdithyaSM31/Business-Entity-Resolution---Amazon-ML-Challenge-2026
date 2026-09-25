@@ -32,7 +32,7 @@ python -m src.predict --run-id <run_id>
 python -m src.run_pipeline
 ```
 
-Environment variables: `BER_DATA_DIR`, `BER_CACHE_DIR`, `BER_MODEL_DIR`, `BER_OUTPUT_DIR` override the default folders; `BER_SAMPLE_FRAC=0.2` develops on a fixed 20% of Source 1 entities.
+Environment variables: `BER_DATA_DIR`, `BER_CACHE_DIR`, `BER_MODEL_DIR`, `BER_OUTPUT_DIR` override the default folders; `BER_SAMPLE_FRAC` sets the fixed share of train Source 1 entities we use (default 0.2 = 440,555 entities); test is never sampled.
 
 ## Layout
 
