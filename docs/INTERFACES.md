@@ -40,7 +40,7 @@ v0 may fill only `name_norm`, `name_core`, `addr_norm`; the other columns can be
 - folds: `s1_id, country, n_true, fold` (every training S1, including singletons)
 
 ## `cache/emb/…` (Adithya, `embeddings.py`)
-- `{tag}_{split}.npy`: float16, L2-normalized, open with `np.load(..., mmap_mode="r")` (train is about 9.6 GB); row *i* is the entity in row *i* of `{tag}_{split}_ids.parquet` (`source, entity_id, country`). Rows are sorted by source, then country, so each (source, country) block is contiguous. Tags: `e5s` (name + address), `e5s-name` (name only).
+- `{tag}_{split}.npy`: float16, L2-normalized, open with `np.load(..., mmap_mode="r")` (train is about 9.6 GB); row *i* is the entity in row *i* of `{tag}_{split}_ids.parquet` (`source, entity_id, country`). Rows are sorted by source, then country, so each (source, country) block is contiguous. Tags: `e5s` (name + address, always built), `e5s-name` (name only, opt-in because it costs another ~9–10 GB per split).
 - `dense_neighbors_{split}.parquet`: `s1_id, cand_id, score` (the dense blocking pass for Siva). Up to 10 neighbours per S1 per target source plus reverse neighbours, capped at 30 per S1. Train covers only the 20% dev sample of S1 (`BER_SAMPLE_FRAC=0.2`); test covers every S1.
 
 ## `cache/candidates_{split}.parquet` (Siva, `blocking.py`)

@@ -3,7 +3,8 @@
 Model: intfloat/multilingual-e5-small (MIT); every text is prefixed with "query: " (symmetric matching).
 It is multilingual, so it can link Devanagari / Kannada names to their Latin spellings, which
 character n-gram TF-IDF cannot.
-Two views per record: "{tag}" = name + address, "{tag}-name" = name only.
+Views: "{tag}" = name + address (default); "{tag}-name" = name only (opt-in with --views full name,
+about 9-10 GB of extra disk per split).
 
 Outputs (per split; rows ordered by source, then country, so every (source, country) block is contiguous):
   cache/emb/{tag}_{split}.npy                 float16 memmap, L2-normalized, row i = row i of the ids file
@@ -23,6 +24,7 @@ Usage:
 """
 import argparse
 import json
+import shutil
 import time
 import unicodedata
 
@@ -100,28 +102,49 @@ def _load_model(model_name: str):
     return model
 
 
-def encode_records(tag: str = DEFAULT_TAG, model_name: str = DEFAULT_MODEL, views=("full", "name"),
+def _rows_done(view_tag: str, split: str) -> int:
+    prog_path = config.cache_path(f"emb/{view_tag}_{split}.progress.json")
+    emb_path = config.cache_path(f"emb/{view_tag}_{split}.npy")
+    return json.loads(prog_path.read_text())["rows_done"] if prog_path.exists() and emb_path.exists() else 0
+
+
+def _is_complete(view_tag: str, split: str) -> bool:
+    ids_path = config.cache_path(f"emb/{view_tag}_{split}_ids.parquet")
+    return ids_path.exists() and _rows_done(view_tag, split) >= pq.ParquetFile(ids_path).metadata.num_rows
+
+
+def encode_records(tag: str = DEFAULT_TAG, model_name: str = DEFAULT_MODEL, views=("full",),
                    batch_size: int = 1024) -> None:
-    """Encode every record of both splits; resumable (re-running continues after the last finished chunk)."""
+    """Encode every record of both splits; resumable (re-running continues after the last finished chunk).
+
+    Each view costs about 9-10 GB of disk per split (float16, 384 dims), so the name-only view is opt-in.
+    """
     model = _load_model(model_name)
     dim = model.get_sentence_embedding_dimension()
     for split in config.SPLITS:
+        view_tags = {view: tag if view == "full" else f"{tag}-{view}" for view in views}
+        pending = [v for v in views if not _is_complete(view_tags[v], split)]
+        if not pending:
+            _log(f"{split}: views {list(views)} already complete")
+            continue
         rec = load_records(split)
-        for view in views:
-            view_tag = tag if view == "full" else f"{tag}-{view}"
+        for view in pending:
+            view_tag = view_tags[view]
             model.max_seq_length = 64 if view == "full" else 32
             emb_path = config.cache_path(f"emb/{view_tag}_{split}.npy")
             ids_path = config.cache_path(f"emb/{view_tag}_{split}_ids.parquet")
             prog_path = config.cache_path(f"emb/{view_tag}_{split}.progress.json")
-            done = json.loads(prog_path.read_text())["rows_done"] if prog_path.exists() and emb_path.exists() else 0
+            done = _rows_done(view_tag, split)
             if done == 0:
+                need = len(rec) * dim * 2
+                free = shutil.disk_usage(emb_path.parent).free
+                if need > free - 2e9:
+                    raise OSError(f"{view_tag} {split} needs {need / 1e9:.1f} GB but only {free / 1e9:.1f} GB is free "
+                                  f"on {emb_path.anchor}; free up space or set BER_CACHE_DIR to another drive")
                 rec[["source", "entity_id", "country"]].to_parquet(ids_path, index=False)
                 emb = np.lib.format.open_memmap(emb_path, mode="w+", dtype=np.float16, shape=(len(rec), dim))
             else:
                 emb = np.load(emb_path, mmap_mode="r+")
-            if done >= len(rec):
-                _log(f"{view_tag} {split}: already complete ({len(rec):,} rows)")
-                continue
             t0 = time.time()
             for start in range(done, len(rec), ENCODE_CHUNK):
                 part = rec.iloc[start:start + ENCODE_CHUNK]
@@ -292,7 +315,8 @@ if __name__ == "__main__":
     parser.add_argument("step", choices=["encode", "neighbors", "features", "all"])
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--tag", default=DEFAULT_TAG)
-    parser.add_argument("--views", nargs="+", default=["full", "name"], choices=["full", "name"])
+    parser.add_argument("--views", nargs="+", default=["full"], choices=["full", "name"],
+                        help="'name' adds a name-only view (about 9-10 GB more disk per split)")
     parser.add_argument("--k", type=int, default=10, help="neighbours per S1 per target source")
     parser.add_argument("--k-reverse", type=int, default=3, help="S1 neighbours per S2/S3 record")
     parser.add_argument("--max-per-s1", type=int, default=30)
