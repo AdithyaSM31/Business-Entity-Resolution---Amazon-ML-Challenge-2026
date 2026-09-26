@@ -1,7 +1,2 @@
 date_ist,split,top_n,passes,tfidf_k,chunk_size,total_pairs,pair_recall,entity_ceiling,oracle_f05,mean_cands,p50_cands,p95_cands
-2026-09-25 15:10,train,all,tfidf_name,20,2000,9854210,0.924105,0.892301,0.941200,22.37,20,38
-2026-09-25 19:40,train,all,tfidf_name|tfidf_full|rare_token|addr_key|dense|reverse,20,2000,24891450,0.993420,0.981140,0.994810,56.50,52,78
-2026-09-25 20:15,train,20,tfidf_name|tfidf_full|rare_token|addr_key|dense|reverse,20,2000,8811100,0.975410,0.948210,0.982100,20.00,20,20
-2026-09-25 20:16,train,30,tfidf_name|tfidf_full|rare_token|addr_key|dense|reverse,20,2000,13216650,0.986230,0.967840,0.989920,30.00,30,30
-2026-09-25 20:17,train,50,tfidf_name|tfidf_full|rare_token|addr_key|dense|reverse,20,2000,16917312,0.991428,0.978215,0.993512,38.40,36,50
-2026-09-25 20:18,train,80,tfidf_name|tfidf_full|rare_token|addr_key|dense|reverse,20,2000,22468305,0.992850,0.980120,0.994410,51.00,48,80
+2026-09-26 12:40,train,30,dense|exact_name|rare_token|addr_key,20,2000,12954979,0.9579,0.8744,0.9852,29.40,30,30
