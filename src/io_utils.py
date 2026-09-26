@@ -69,4 +69,26 @@ def write_id_lists(s1_ids: list[str], id_lists: dict[str, list[str]], list_col: 
     - IDs are comma-joined with no spaces or quotes, no duplicates, S2-/S3- IDs from the test set only
     - an entity with no IDs gets an empty string (never "nan"); UTF-8 with "\\n" line endings
     """
-    raise NotImplementedError("AR-2")
+    if list_col not in {"matched_entity_ids", "candidate_entity_ids"}:
+        raise ValueError(f"unsupported list column: {list_col}")
+
+    test_s1 = read_source("test", 1)["entity_id"].tolist()
+    assert list(s1_ids) == test_s1, "s1_ids must be the test Source 1 IDs in file order"
+
+    valid_ids = set(read_source("test", 2)["entity_id"]) | set(read_source("test", 3)["entity_id"])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write(f"source1_entity_id\t{list_col}\n")
+        for s1_id in s1_ids:
+            seen = set()
+            values = []
+            for cand_id in id_lists.get(s1_id, []):
+                assert isinstance(cand_id, str), f"candidate ID must be str: {cand_id!r}"
+                assert cand_id.startswith(("S2-", "S3-")), f"invalid candidate ID: {cand_id}"
+                assert cand_id in valid_ids, f"candidate ID not in test S2/S3: {cand_id}"
+                if cand_id not in seen:
+                    seen.add(cand_id)
+                    values.append(cand_id)
+            f.write(f"{s1_id}\t{','.join(values)}\n")
