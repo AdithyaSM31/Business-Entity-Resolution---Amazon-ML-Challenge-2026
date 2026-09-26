@@ -307,7 +307,212 @@ def build_context_features(split: str) -> pd.DataFrame:
 
 
 def build_stage2_features(split: str, run_id: str) -> pd.DataFrame:
-    raise NotImplementedError("SI-5")
+    """Compute stage-2 context features from stage-1 out-of-fold probabilities.
+
+    Input:
+      cache/preds/{run_id}_{split}.parquet  columns: s1_id, cand_id, prob
+                                            (+ 'fold' on train - OOF only)
+      cache/candidates_{split}.parquet      for cand_source column
+      cache/records.parquet                 for name_core (cross-source support)
+
+    Output:
+      cache/feat_ctx2_{split}_{run_id}.parquet
+
+    Feature catalogue
+    -----------------
+    fc2_rank_p            : rank of this prob within the S1 (0 = highest)
+    fc2_gap_p             : max prob for this S1 minus this prob
+    fc2_second_p          : the S1's second-highest prob (NaN if only 1 cand)
+    fc2_rev_rank_p        : rank of this S1 among all S1s listing this cand_id, by prob
+    fc2_mutual_best       : 1 if this pair is both the S1's best AND the cand's best S1
+    fc2_best_competitor_p : highest prob of this cand_id with any OTHER S1
+    fc2_support           : max over S1's other-source candidates a of
+                            p(s1, a) * token_set_ratio(name_core(a), name_core(cand)) / 100
+    fc2_n_above_05        : number of this S1's candidates with prob > 0.5
+    """
+    import time as _time
+    from collections import defaultdict
+
+    from rapidfuzz.fuzz import token_set_ratio
+
+    t0 = _time.perf_counter()
+    print(f"\n=== build_stage2_features(split={split!r}, run_id={run_id!r}) ===")
+
+    # ------------------------------------------------------------------ #
+    # 1.  Load predictions
+    # ------------------------------------------------------------------ #
+    preds_path = config.cache_path(f"preds/{run_id}_{split}.parquet")
+    if not preds_path.exists():
+        raise FileNotFoundError(
+            f"preds/{run_id}_{split}.parquet not found. "
+            f"Run train.py / predict.py with run_id={run_id!r} first."
+        )
+    preds = pd.read_parquet(preds_path, columns=["s1_id", "cand_id", "prob"])
+    preds["prob"] = preds["prob"].astype(np.float32)
+    print(f"  preds:  {len(preds):,} pairs  (run_id={run_id!r})")
+
+    # ------------------------------------------------------------------ #
+    # 2.  Attach cand_source
+    # ------------------------------------------------------------------ #
+    cands_path = config.cache_path(f"candidates_{split}.parquet")
+    if cands_path.exists():
+        cands_src = pd.read_parquet(
+            cands_path, columns=["s1_id", "cand_id", "cand_source"]
+        )
+        preds = preds.merge(cands_src, on=["s1_id", "cand_id"], how="left")
+    else:
+        preds["cand_source"] = preds["cand_id"].str[1].astype(np.int8)
+    preds["cand_source"] = preds["cand_source"].fillna(0).astype(np.int8)
+
+    # ------------------------------------------------------------------ #
+    # 3.  Load name_core for fc2_support
+    # ------------------------------------------------------------------ #
+    recs_path = config.cache_path("records.parquet")
+    if recs_path.exists():
+        import pyarrow.parquet as pq
+        avail = set(pq.read_schema(recs_path).names)
+        cols = [c for c in ["split", "entity_id", "name_core"] if c in avail]
+        recs = pd.read_parquet(recs_path, columns=cols)
+        if "split" in recs.columns:
+            recs = recs[recs["split"] == split]
+    else:
+        frames = []
+        for src in config.SOURCES:
+            raw = io_utils.read_source(split, src)
+            raw["name_core"] = raw["business_name"].str.lower().fillna("")
+            frames.append(raw[["entity_id", "name_core"]])
+        recs = pd.concat(frames, ignore_index=True)
+    name_core_map: dict[str, str] = (
+        recs[["entity_id", "name_core"]]
+        .drop_duplicates("entity_id")
+        .set_index("entity_id")["name_core"]
+        .to_dict()
+    )
+    print(f"  records: {len(name_core_map):,} unique entity_ids for support")
+
+    # ------------------------------------------------------------------ #
+    # 4.  fc2_rank_p, fc2_gap_p, fc2_second_p, fc2_n_above_05
+    # ------------------------------------------------------------------ #
+    preds["fc2_rank_p"] = (
+        preds.groupby("s1_id")["prob"]
+        .rank(method="first", ascending=False)
+        .sub(1)
+        .astype(np.float32)
+    )
+
+    s1_max_p = preds.groupby("s1_id")["prob"].max().rename("_max_p")
+    preds = preds.join(s1_max_p, on="s1_id")
+    preds["fc2_gap_p"] = (preds["_max_p"] - preds["prob"]).astype(np.float32)
+    preds.drop(columns=["_max_p"], inplace=True)
+
+    def _second(ser: pd.Series) -> float:
+        vals = ser.nlargest(2).values
+        return float(vals[1]) if len(vals) >= 2 else np.nan
+
+    s1_second = preds.groupby("s1_id")["prob"].apply(_second).rename("fc2_second_p")
+    preds = preds.join(s1_second, on="s1_id")
+    preds["fc2_second_p"] = preds["fc2_second_p"].astype(np.float32)
+
+    above_05 = (
+        preds[preds["prob"] > 0.5]
+        .groupby("s1_id")["cand_id"]
+        .count()
+        .rename("fc2_n_above_05")
+    )
+    preds = preds.join(above_05, on="s1_id")
+    preds["fc2_n_above_05"] = preds["fc2_n_above_05"].fillna(0).astype(np.float32)
+
+    # ------------------------------------------------------------------ #
+    # 5.  fc2_rev_rank_p, fc2_mutual_best, fc2_best_competitor_p
+    # ------------------------------------------------------------------ #
+    preds["fc2_rev_rank_p"] = (
+        preds.groupby("cand_id")["prob"]
+        .rank(method="first", ascending=False)
+        .sub(1)
+        .astype(np.float32)
+    )
+
+    preds["fc2_mutual_best"] = (
+        (preds["fc2_rank_p"] == 0) & (preds["fc2_rev_rank_p"] == 0)
+    ).astype(np.float32)
+
+    cand_max_p = preds.groupby("cand_id")["prob"].max().rename("_cand_max_p")
+    cand_2nd_p = (
+        preds.groupby("cand_id")["prob"].apply(_second).rename("_cand_2nd_p")
+    )
+    preds = preds.join(cand_max_p, on="cand_id").join(cand_2nd_p, on="cand_id")
+    # If this row is the cand's max, its best competitor is the second-max;
+    # otherwise it's the overall max.  Use >= to handle float ties correctly.
+    is_cand_max = preds["prob"] >= preds["_cand_max_p"]
+    preds["fc2_best_competitor_p"] = np.where(
+        is_cand_max,
+        preds["_cand_2nd_p"],
+        preds["_cand_max_p"],
+    ).astype(np.float32)
+    preds.drop(columns=["_cand_max_p", "_cand_2nd_p"], inplace=True)
+
+    # ------------------------------------------------------------------ #
+    # 6.  fc2_support  (per-S1 loop; lists are short after pruning)
+    #
+    #   For candidate c (source X) of S1 e:
+    #     max over e's candidates a from the OTHER source of
+    #       p(e, a) * token_set_ratio(name_core_a, name_core_c) / 100
+    #
+    #   Cross-source mutual support: if an S2 and S3 both resemble S1
+    #   AND look like each other, they reinforce each other's candidacy.
+    # ------------------------------------------------------------------ #
+    print("  Computing fc2_support ...", end="", flush=True)
+
+    s1_cands: dict[str, list[tuple]] = defaultdict(list)
+    for row in preds[["s1_id", "cand_id", "cand_source", "prob"]].itertuples(index=False):
+        s1_cands[row.s1_id].append((row.cand_id, int(row.cand_source), float(row.prob)))
+
+    pair_to_idx: dict[tuple[str, str], int] = {
+        (row.s1_id, row.cand_id): i
+        for i, row in enumerate(preds[["s1_id", "cand_id"]].itertuples(index=False))
+    }
+
+    support_arr = np.zeros(len(preds), dtype=np.float32)
+    for s1, cand_list in s1_cands.items():
+        for c_id, c_src, _ in cand_list:
+            c_name = name_core_map.get(c_id, "")
+            best_sup = 0.0
+            other_src = 3 if c_src == 2 else 2
+            for a_id, a_src, a_p in cand_list:
+                if a_src != other_src:
+                    continue
+                a_name = name_core_map.get(a_id, "")
+                sim = token_set_ratio(a_name, c_name) / 100.0
+                val = a_p * sim
+                if val > best_sup:
+                    best_sup = val
+            idx = pair_to_idx.get((s1, c_id))
+            if idx is not None:
+                support_arr[idx] = best_sup
+
+    preds["fc2_support"] = support_arr
+    print(" done")
+
+    # ------------------------------------------------------------------ #
+    # 7.  Assemble and persist
+    # ------------------------------------------------------------------ #
+    fc2_cols = [
+        "fc2_rank_p", "fc2_gap_p", "fc2_second_p",
+        "fc2_rev_rank_p", "fc2_mutual_best", "fc2_best_competitor_p",
+        "fc2_support", "fc2_n_above_05",
+    ]
+    out = preds[["s1_id", "cand_id"] + fc2_cols].copy()
+    for c in fc2_cols:
+        out[c] = out[c].astype(np.float32)
+
+    out_path = config.cache_path(f"feat_ctx2_{split}_{run_id}.parquet")
+    out.to_parquet(out_path, index=False)
+    elapsed = _time.perf_counter() - t0
+    print(
+        f"\n  Saved {len(out):,} rows x {len(out.columns)} columns -> {out_path}"
+        f"  ({elapsed:.1f}s)"
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -326,15 +531,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.stage1_run:
-        build_stage2_features(args.split, args.stage1_run)
-    else:
-        feat = build_context_features(args.split)
+        feat = build_stage2_features(args.split, args.stage1_run)
+        fc2_cols = [c for c in feat.columns if c.startswith("fc2_")]
 
-        # ---------------------------------------------------------------- #
-        # Diagnostic: describe() split by label.                            #
-        # Ground truth is ONLY accessed here in __main__, never in the       #
-        # feature computation above.                                         #
-        # ---------------------------------------------------------------- #
+        # Diagnostic: describe() by label (GT accessed here only)
         if args.split == "train":
             try:
                 gt_raw = io_utils.read_ground_truth()
@@ -342,16 +542,40 @@ if __name__ == "__main__":
                 for row in gt_raw.itertuples(index=False):
                     for m in row.matches:
                         gt_pairs.add((row.s1_id, m))
-
                 feat["_label"] = [
                     1 if (s, c) in gt_pairs else 0
                     for s, c in zip(feat["s1_id"], feat["cand_id"])
                 ]
-                fc_cols = [c for c in feat.columns if c.startswith("fc_")]
-                print("\n--- describe() by label ---")
+                print("\n--- describe() by label (fc2_*) ---")
+                for lbl, grp in feat.groupby("_label"):
+                    lbl_str = "POSITIVE" if lbl == 1 else "negative"
+                    print(f"\n  label={lbl_str}  (n={len(grp):,})")
+                    print(grp[fc2_cols].describe().to_string())
+            except Exception as exc:
+                print(f"\n  [diagnostic skipped: {exc}]")
+
+    else:
+        feat = build_context_features(args.split)
+        fc_cols = [c for c in feat.columns if c.startswith("fc_")]
+
+        # Diagnostic: describe() by label (GT accessed here only)
+        if args.split == "train":
+            try:
+                gt_raw = io_utils.read_ground_truth()
+                gt_pairs_fc: set[tuple[str, str]] = set()
+                for row in gt_raw.itertuples(index=False):
+                    for m in row.matches:
+                        gt_pairs_fc.add((row.s1_id, m))
+
+                feat["_label"] = [
+                    1 if (s, c) in gt_pairs_fc else 0
+                    for s, c in zip(feat["s1_id"], feat["cand_id"])
+                ]
+                print("\n--- describe() by label (fc_*) ---")
                 for lbl, grp in feat.groupby("_label"):
                     lbl_str = "POSITIVE" if lbl == 1 else "negative"
                     print(f"\n  label={lbl_str}  (n={len(grp):,})")
                     print(grp[fc_cols].describe().to_string())
             except Exception as exc:
                 print(f"\n  [diagnostic skipped: {exc}]")
+
