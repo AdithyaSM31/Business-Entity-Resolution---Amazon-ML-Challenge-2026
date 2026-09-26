@@ -186,7 +186,15 @@ def build_context_features(split: str) -> pd.DataFrame:
     # ------------------------------------------------------------------ #
     n_cands_map = cands.groupby("s1_id")["cand_id"].count().rename("n_cands")
 
-    if "bs_tfidf_name" in cands.columns:
+    if "bs_dense" in cands.columns and cands["bs_dense"].notna().any():
+        close_mask  = cands["bs_dense"].fillna(0.0) >= 0.95
+        n_close_map = (
+            cands[close_mask]
+            .groupby("s1_id")["cand_id"]
+            .count()
+            .rename("n_close")
+        )
+    elif "bs_tfidf_name" in cands.columns and cands["bs_tfidf_name"].notna().any():
         close_mask  = cands["bs_tfidf_name"].fillna(0.0) >= 0.8
         n_close_map = (
             cands[close_mask]
@@ -218,7 +226,32 @@ def build_context_features(split: str) -> pd.DataFrame:
     # 6.  Reverse rank: fc_rev_rank, fc_rev_n
     #     For each cand_id: rank this S1 among all S1s that list it
     # ------------------------------------------------------------------ #
-    if "prune_score" in cands.columns:
+    dense_all_path = config.cache_path("emb/dense_neighbors_train_all.parquet")
+    if split == "train" and dense_all_path.exists():
+        print(f"  [fc_rev] Using {dense_all_path} (full 2.2M train S1) for reverse competition features...")
+        dense_all = pd.read_parquet(dense_all_path, columns=["s1_id", "cand_id", "score"])
+        rev_n_map = dense_all.groupby("cand_id")["s1_id"].count()
+        fc_rev_n = cands["cand_id"].map(rev_n_map).fillna(1).astype(np.float32).values
+
+        dense_all["rev_rank"] = (
+            dense_all.groupby("cand_id")["score"]
+            .rank(method="first", ascending=False)
+            .sub(1)
+            .astype(np.float32)
+        )
+        cands_ranked = cands[["s1_id", "cand_id"]].merge(
+            dense_all[["s1_id", "cand_id", "rev_rank"]],
+            on=["s1_id", "cand_id"],
+            how="left",
+        )
+        sample_rev_rank = (
+            cands.groupby("cand_id")["prune_score"]
+            .rank(method="first", ascending=False)
+            .sub(1)
+            .astype(np.float32)
+        ) if "prune_score" in cands.columns else pd.Series(0.0, index=cands.index)
+        fc_rev_rank = cands_ranked["rev_rank"].fillna(sample_rev_rank).astype(np.float32).values
+    elif "prune_score" in cands.columns:
         # rank within cand_id groups (0 = highest prune_score = best)
         fc_rev_rank = (
             cands.groupby("cand_id")["prune_score"]
@@ -405,11 +438,10 @@ def build_stage2_features(split: str, run_id: str) -> pd.DataFrame:
     preds["fc2_gap_p"] = (preds["_max_p"] - preds["prob"]).astype(np.float32)
     preds.drop(columns=["_max_p"], inplace=True)
 
-    def _second(ser: pd.Series) -> float:
-        vals = ser.nlargest(2).values
-        return float(vals[1]) if len(vals) >= 2 else np.nan
-
-    s1_second = preds.groupby("s1_id")["prob"].apply(_second).rename("fc2_second_p")
+    # S1 second highest prob using sort + cumcount (vectorized, no slow Python groupby.apply)
+    s1_sorted = preds[["s1_id", "prob"]].sort_values(["s1_id", "prob"], ascending=[True, False])
+    s1_sorted["_rank"] = s1_sorted.groupby("s1_id").cumcount()
+    s1_second = s1_sorted[s1_sorted["_rank"] == 1].set_index("s1_id")["prob"].rename("fc2_second_p")
     preds = preds.join(s1_second, on="s1_id")
     preds["fc2_second_p"] = preds["fc2_second_p"].astype(np.float32)
 
@@ -437,12 +469,13 @@ def build_stage2_features(split: str, run_id: str) -> pd.DataFrame:
     ).astype(np.float32)
 
     cand_max_p = preds.groupby("cand_id")["prob"].max().rename("_cand_max_p")
-    cand_2nd_p = (
-        preds.groupby("cand_id")["prob"].apply(_second).rename("_cand_2nd_p")
-    )
+    cand_sorted = preds[["cand_id", "prob"]].sort_values(["cand_id", "prob"], ascending=[True, False])
+    cand_sorted["_rank"] = cand_sorted.groupby("cand_id").cumcount()
+    cand_2nd_p = cand_sorted[cand_sorted["_rank"] == 1].set_index("cand_id")["prob"].rename("_cand_2nd_p")
     preds = preds.join(cand_max_p, on="cand_id").join(cand_2nd_p, on="cand_id")
+
     # If this row is the cand's max, its best competitor is the second-max;
-    # otherwise it's the overall max.  Use >= to handle float ties correctly.
+    # otherwise it's the overall max. Use >= to handle float ties correctly.
     is_cand_max = preds["prob"] >= preds["_cand_max_p"]
     preds["fc2_best_competitor_p"] = np.where(
         is_cand_max,
@@ -452,45 +485,68 @@ def build_stage2_features(split: str, run_id: str) -> pd.DataFrame:
     preds.drop(columns=["_cand_max_p", "_cand_2nd_p"], inplace=True)
 
     # ------------------------------------------------------------------ #
-    # 6.  fc2_support  (per-S1 loop; lists are short after pruning)
+    # 6.  fc2_support (vectorized cross-source support using cdist)
     #
     #   For candidate c (source X) of S1 e:
-    #     max over e's candidates a from the OTHER source of
+    #     max over e's candidates a from OTHER source (top 5 by prob) of
     #       p(e, a) * token_set_ratio(name_core_a, name_core_c) / 100
-    #
-    #   Cross-source mutual support: if an S2 and S3 both resemble S1
-    #   AND look like each other, they reinforce each other's candidacy.
     # ------------------------------------------------------------------ #
-    print("  Computing fc2_support ...", end="", flush=True)
+    print("  Computing fc2_support (vectorized) ...", end="", flush=True)
 
-    s1_cands: dict[str, list[tuple]] = defaultdict(list)
-    for row in preds[["s1_id", "cand_id", "cand_source", "prob"]].itertuples(index=False):
-        s1_cands[row.s1_id].append((row.cand_id, int(row.cand_source), float(row.prob)))
+    preds["_src_rank"] = (
+        preds.groupby(["s1_id", "cand_source"])["prob"]
+        .rank(method="first", ascending=False)
+    )
+    preds_top5 = preds[preds["_src_rank"] <= 5].copy()
 
-    pair_to_idx: dict[tuple[str, str], int] = {
-        (row.s1_id, row.cand_id): i
-        for i, row in enumerate(preds[["s1_id", "cand_id"]].itertuples(index=False))
-    }
+    has_s2 = set(preds_top5.loc[preds_top5["cand_source"] == 2, "s1_id"].unique())
+    has_s3 = set(preds_top5.loc[preds_top5["cand_source"] == 3, "s1_id"].unique())
+    s1_both = has_s2 & has_s3
 
-    support_arr = np.zeros(len(preds), dtype=np.float32)
-    for s1, cand_list in s1_cands.items():
-        for c_id, c_src, _ in cand_list:
-            c_name = name_core_map.get(c_id, "")
-            best_sup = 0.0
-            other_src = 3 if c_src == 2 else 2
-            for a_id, a_src, a_p in cand_list:
-                if a_src != other_src:
-                    continue
-                a_name = name_core_map.get(a_id, "")
-                sim = token_set_ratio(a_name, c_name) / 100.0
-                val = a_p * sim
-                if val > best_sup:
-                    best_sup = val
-            idx = pair_to_idx.get((s1, c_id))
-            if idx is not None:
-                support_arr[idx] = best_sup
+    support_map: dict[tuple[str, str], float] = {}
 
-    preds["fc2_support"] = support_arr
+    if s1_both:
+        both_df = preds_top5[preds_top5["s1_id"].isin(s1_both)].copy()
+        both_df["name"] = both_df["cand_id"].map(name_core_map).fillna("").astype(str)
+
+        try:
+            from rapidfuzz.process import cdist
+            use_cdist = True
+        except ImportError:
+            use_cdist = False
+
+        for s1_id, grp in both_df.groupby("s1_id"):
+            g2 = grp[grp["cand_source"] == 2]
+            g3 = grp[grp["cand_source"] == 3]
+            if len(g2) == 0 or len(g3) == 0:
+                continue
+
+            names2 = g2["name"].tolist()
+            names3 = g3["name"].tolist()
+            cands2 = g2["cand_id"].tolist()
+            cands3 = g3["cand_id"].tolist()
+            probs2 = g2["prob"].values
+            probs3 = g3["prob"].values
+
+            if use_cdist:
+                sim_mat = cdist(names2, names3, scorer=token_set_ratio, dtype=np.float32) / 100.0
+            else:
+                sim_mat = np.array([
+                    [token_set_ratio(n2, n3) / 100.0 for n3 in names3]
+                    for n2 in names2
+                ], dtype=np.float32)
+
+            sup2 = (sim_mat * probs3[np.newaxis, :]).max(axis=1)
+            for cid, val in zip(cands2, sup2):
+                support_map[(s1_id, cid)] = float(val)
+
+            sup3 = (sim_mat * probs2[:, np.newaxis]).max(axis=0)
+            for cid, val in zip(cands3, sup3):
+                support_map[(s1_id, cid)] = float(val)
+
+    pair_series = pd.Series(list(zip(preds["s1_id"], preds["cand_id"])))
+    preds["fc2_support"] = pair_series.map(support_map).fillna(0.0).astype(np.float32).values
+    preds.drop(columns=["_src_rank"], inplace=True)
     print(" done")
 
     # ------------------------------------------------------------------ #
