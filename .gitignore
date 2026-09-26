@@ -4,6 +4,7 @@ student_resource/
 cache/
 models/
 output/*.tsv
+output_v*/
 *.zip
 *.parquet
 *.npy

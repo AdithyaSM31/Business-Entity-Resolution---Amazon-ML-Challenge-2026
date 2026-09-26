@@ -1,15 +1,18 @@
-"""Quick stage-1 model on the dense candidates (AD-3a). Owner: Adithya.
+"""Quick stage-1 model on the dense candidates (AD-3a, v2). Owner: Adithya.
 
 A self-contained first submission that needs nothing from the other stages:
-candidates = cache/emb/dense_neighbors_{split}.parquet, features = dense score and rank features plus
-rapidfuzz name/address scores on basic-cleaned text, model = LightGBM, selection = exclusivity + a
-threshold tuned on a held-out 20% of the train sample for macro F0.5.
+candidates = the dense neighbours (train: dense_neighbors_train_all.parquet filtered to the 20% sample,
+so every S1 competes against the full field of S1s exactly as on test), features = dense score, rank
+and competition features plus rapidfuzz name/address scores on basic-cleaned text, model = LightGBM
+trained 5-fold on cache/folds.parquet (out-of-fold predictions for every sampled S1, saved in the
+format src/evaluate.py reads), selection = exclusivity + a threshold tuned on those predictions.
 
 It is a stop-gap: the proper pipeline (Siva's candidates, Bhanu's features, Arushi's folds, metric,
 writers and selection) replaces each piece as it lands.
 
 Usage:
   python -m src.quick_model text                      # cache basic-cleaned name/address (both splits)
+  python -m src.quick_model pairs --split train       # candidates + competition features; then --split test
   python -m src.quick_model features --split train    # then --split test
   python -m src.quick_model train --run-id <id>
   python -m src.quick_model submit --run-id <id>      # predict test, write output/*.tsv, validate
@@ -20,11 +23,11 @@ import re
 import subprocess
 import sys
 import time
-import zlib
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
@@ -35,7 +38,6 @@ from .embeddings import _basic_clean
 POSTCODE_RE = r"(?<!\d)(\d{5,6})(?!\d)"
 FIRST_NUMBER_RE = r"(\d+)"
 PAIR_CHUNK = 2_000_000
-HOLDOUT_BUCKETS = 2  # hash(s1_id) % 10 < 2 -> held out (20% of the sample)
 
 NAME_SCORERS = {
     "ratio": fuzz.ratio,
@@ -78,6 +80,65 @@ def _cpdist(a: np.ndarray, b: np.ndarray, scorer) -> np.ndarray:
     return out if scorer is JaroWinkler.normalized_similarity else out / 100.0
 
 
+def _group_rank(key: np.ndarray, score: np.ndarray):
+    """Per row: rank of its score within its key group (0 = best), the group's best score, and the
+    best score among the OTHER rows of the group (NaN when it is alone)."""
+    order = np.lexsort((-score, key))
+    k_sorted, s_sorted = key[order], score[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(k_sorted)) + 1]
+    sizes = np.diff(np.r_[starts, len(order)])
+    start_of = np.repeat(starts, sizes)
+    rank, best, other = (np.empty(len(key), np.float32) for _ in range(3))
+    rank[order] = np.arange(len(order)) - start_of
+    best[order] = s_sorted[start_of]
+    second = np.where(np.repeat(sizes, sizes) > 1, s_sorted[np.minimum(start_of + 1, len(order) - 1)], np.nan)
+    other[order] = np.where(rank[order] == 0, second, s_sorted[start_of])
+    return rank, best, other
+
+
+def build_pairs(split: str) -> None:
+    """cache/quick/pairs_{split}.parquet: candidate pairs, grouped by S1, with competition features.
+
+    Competition features (how many S1s list this record, where this S1 ranks among them, the best rival
+    score) are computed on the full field of S1s: for train that is dense_neighbors_train_all, which is
+    then filtered to the dev sample. Computing them on the sample alone makes every record look ~2.7x
+    less contested on train than on test.
+    """
+    t0 = time.time()
+    name = "emb/dense_neighbors_train_all.parquet" if split == "train" else f"emb/dense_neighbors_{split}.parquet"
+    t = pq.read_table(config.cache_path(name), columns=["s1_id", "cand_id", "score"])
+    s1 = pc.dictionary_encode(t["s1_id"]).combine_chunks()
+    cand = pc.dictionary_encode(t["cand_id"]).combine_chunks()
+    s_code = s1.indices.to_numpy().astype(np.int64)
+    c_code = cand.indices.to_numpy().astype(np.int64)
+    score = t["score"].to_numpy().astype(np.float32)
+    _log(f"{split}: {len(score):,} pairs over {len(s1.dictionary):,} S1 loaded ({time.time() - t0:.0f}s)")
+
+    rev_rank, cand_best, rival = _group_rank(c_code, score)
+    s1_rank, _, _ = _group_rank(s_code, score)
+    rev_n = np.bincount(c_code)[c_code].astype(np.float32)
+    close = (score >= cand_best - 0.02).astype(np.float64)
+    comp = {
+        "q_rev_n": rev_n,
+        "q_rev_rank": rev_rank,
+        "q_rev_n_close": np.bincount(c_code, weights=close)[c_code].astype(np.float32),
+        "q_cand_best": cand_best,
+        "q_gap_cand_best": (cand_best - score).astype(np.float32),
+        "q_rival_margin": (score - rival).astype(np.float32),  # >0 when this S1 beats every rival
+        "q_mutual_best": ((s1_rank == 0) & (rev_rank == 0)).astype(np.float32),
+    }
+    keep = np.arange(len(score))
+    if split == "train" and config.SAMPLE_FRAC < 1:
+        in_sample = np.fromiter((io_utils.in_dev_sample(v) for v in s1.dictionary.to_pylist()),
+                                bool, len(s1.dictionary))
+        keep = np.flatnonzero(in_sample[s_code])
+    out = pa.table({"s1_id": t["s1_id"].take(keep), "cand_id": t["cand_id"].take(keep),
+                    "score": pa.array(score[keep]), **{k: pa.array(v[keep]) for k, v in comp.items()}})
+    pq.write_table(out, config.cache_path(f"quick/pairs_{split}.parquet"))
+    _log(f"{split}: saved {out.num_rows:,} pairs for {pc.count_distinct(out['s1_id']).as_py():,} S1 "
+         f"({time.time() - t0:.0f}s)")
+
+
 def _s1_chunks(path, batch_rows: int = PAIR_CHUNK):
     """Yield DataFrames of whole S1 groups (the dense file is grouped by S1), about batch_rows each."""
     carry = None
@@ -104,7 +165,7 @@ def build_features(split: str) -> None:
     arrays = {c: text[c].to_numpy() for c in ("name", "addr", "postcode", "num", "non_latin")}
     del text
     _log(f"{split}: text cache loaded ({time.time() - t0:.0f}s)")
-    path = config.cache_path(f"emb/dense_neighbors_{split}.parquet")
+    path = config.cache_path(f"quick/pairs_{split}.parquet")
     writer, n_done = None, 0
     for pairs in _s1_chunks(path):
         feats = _chunk_features(pairs, index, arrays)
@@ -137,6 +198,9 @@ def _chunk_features(pairs: pd.DataFrame, index: pd.Index, arrays: dict) -> pd.Da
         "q_mean_score": g.transform("mean").astype(np.float32),
     })
     del g, gs
+    for col in pairs.columns:  # competition features from build_pairs
+        if col.startswith("q_"):
+            feats[col] = pairs[col].to_numpy()
 
     a_pos = index.get_indexer(feats["s1_id"])
     b_pos = index.get_indexer(feats["cand_id"])
@@ -167,10 +231,6 @@ def _chunk_features(pairs: pd.DataFrame, index: pd.Index, arrays: dict) -> pd.Da
 
 # ------------------------------------------------------------------------------------------ metric
 
-def _holdout(s1_ids: pd.Series) -> np.ndarray:
-    return np.fromiter((zlib.crc32(s.encode()) % 10 < HOLDOUT_BUCKETS for s in s1_ids), bool, len(s1_ids))
-
-
 def macro_f05(pred: pd.DataFrame, n_true: pd.Series) -> float:
     """pred: selected pairs with column `label`; n_true: true-match count for every scored S1 (index s1_id)."""
     per = pred.groupby("s1_id")["label"].agg(["sum", "size"])
@@ -192,62 +252,76 @@ def select(df: pd.DataFrame, threshold: float, exclusive: bool) -> pd.DataFrame:
 
 # ------------------------------------------------------------------------------------------ train
 
-FEATURES = None  # resolved from the parquet at train time
+PARAMS = dict(objective="binary", learning_rate=0.1, num_leaves=255, min_child_samples=200,
+              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+              num_threads=config.N_JOBS, verbose=-1, seed=config.SEED)
 
 
-def train(run_id: str, rounds: int = 2000) -> None:
+def train(run_id: str, max_rounds: int = 3000) -> None:
+    """5-fold LightGBM on cache/folds.parquet, out-of-fold predictions saved for src/evaluate.py,
+    a selection rule tuned on them, then one model on the whole sample for test."""
     import lightgbm as lgb
 
     t0 = time.time()
     df = pd.read_parquet(config.cache_path("quick/features_train.parquet"))
     features = [c for c in df.columns if c.startswith("q_")]
-    gt = io_utils.read_ground_truth()
-    gt = gt[gt["s1_id"].isin(set(df["s1_id"].unique()))]
-    truth = gt.explode("matches").dropna().rename(columns={"matches": "cand_id"})
-    df = df.merge(truth.assign(label=np.int8(1)), on=["s1_id", "cand_id"], how="left")
+    labels = pd.read_parquet(config.cache_path("labels.parquet"))
+    folds = pd.read_parquet(config.cache_path("folds.parquet"), columns=["s1_id", "n_true", "fold"])
+    df = df.merge(labels, on=["s1_id", "cand_id"], how="left").merge(folds[["s1_id", "fold"]], on="s1_id", how="left")
+    if df["fold"].isna().any():
+        raise ValueError("some candidate S1 are missing from cache/folds.parquet; rerun python -m src.folds")
     df["label"] = df["label"].fillna(0).astype(np.int8)
-    n_true = gt.set_index("s1_id")["matches"].str.len()
+    n_true = folds.set_index("s1_id")["n_true"]
+    found = df["label"].sum() / n_true.sum()
+    _log(f"{len(df):,} pairs, {len(features)} features, positives {df['label'].mean():.3f}, "
+         f"candidate recall {found:.4f} over {len(n_true):,} S1")
 
-    hold = _holdout(df["s1_id"])
-    _log(f"train rows {(~hold).sum():,}, holdout rows {hold.sum():,}, positives {df['label'].mean():.3f}")
-    params = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_child_samples=100,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=config.N_JOBS, verbose=-1, seed=config.SEED)
-    dtr = lgb.Dataset(df.loc[~hold, features], df.loc[~hold, "label"])
-    dva = lgb.Dataset(df.loc[hold, features], df.loc[hold, "label"], reference=dtr)
-    model = lgb.train(params, dtr, rounds, valid_sets=[dva],
-                      callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)])
-    _log(f"best iteration {model.best_iteration}, holdout logloss {model.best_score['valid_0']['binary_logloss']:.4f}")
+    oof = np.zeros(len(df), dtype=np.float32)
+    best_iters = []
+    for k in sorted(folds["fold"].unique()):
+        va = (df["fold"] == k).to_numpy()
+        dtr = lgb.Dataset(df.loc[~va, features], df.loc[~va, "label"])
+        dva = lgb.Dataset(df.loc[va, features], df.loc[va, "label"], reference=dtr)
+        model = lgb.train(PARAMS, dtr, max_rounds, valid_sets=[dva],
+                          callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(500)])
+        oof[va] = model.predict(df.loc[va, features], num_iteration=model.best_iteration)
+        best_iters.append(model.best_iteration)
+        _log(f"fold {k}: {model.best_iteration} rounds, logloss {model.best_score['valid_0']['binary_logloss']:.4f} "
+             f"({time.time() - t0:.0f}s)")
+    df["prob"] = oof
+    df[["s1_id", "cand_id", "prob", "fold"]].to_parquet(config.cache_path(f"preds/{run_id}_train.parquet"), index=False)
 
-    hv = df.loc[hold, ["s1_id", "cand_id", "label", "q_dense"]].copy()
-    hv["prob"] = model.predict(df.loc[hold, features], num_iteration=model.best_iteration)
-    hold_s1 = n_true[n_true.index.isin(set(hv["s1_id"]))]
-    # S1 entities in the holdout by hash, including any without candidates
-    all_hold = gt[_holdout(gt["s1_id"])].set_index("s1_id")["matches"].str.len()
+    # exclusivity does not depend on the threshold, so apply it once
+    view = df[["s1_id", "cand_id", "label", "prob", "q_dense"]]
+    excl = view.sort_values("prob", ascending=False).drop_duplicates("cand_id")
     results = []
-    for excl in (False, True):
-        for t in np.arange(0.20, 0.91, 0.02):
-            results.append((excl, round(float(t), 2), macro_f05(select(hv, t, excl), all_hold)))
+    for is_excl, base in ((False, view), (True, excl)):
+        for t in np.arange(0.30, 0.86, 0.02):
+            results.append((is_excl, round(float(t), 2), macro_f05(base[base["prob"] >= t], n_true)))
     best_excl, best_t, best_f = max(results, key=lambda r: r[2])
-    # reference: the dense score alone
-    dense_ref = max(((t, macro_f05(select(hv.assign(prob=hv["q_dense"]), t, True), all_hold))
-                     for t in np.arange(0.85, 0.99, 0.005)), key=lambda r: r[1])
-    _log(f"holdout macro F0.5: model {best_f:.4f} (threshold {best_t}, exclusive {best_excl}); "
-         f"dense-score-only baseline {dense_ref[1]:.4f} (threshold {dense_ref[0]:.3f}); "
-         f"{len(all_hold):,} holdout S1 ({len(hold_s1):,} with candidates)")
+    dense_excl = view.sort_values("q_dense", ascending=False).drop_duplicates("cand_id")
+    dense_ref = max(((round(float(t), 3), macro_f05(dense_excl[dense_excl["q_dense"] >= t], n_true))
+                     for t in np.arange(0.88, 0.98, 0.005)), key=lambda r: r[1])
+    per_fold = {int(k): macro_f05(
+        (excl if best_excl else view).pipe(lambda d: d[(d["prob"] >= best_t) & d["s1_id"].isin(set(g))]),
+        n_true.loc[g]) for k, g in folds.groupby("fold")["s1_id"]}
+    _log(f"out-of-fold macro F0.5 {best_f:.4f} (threshold {best_t}, exclusive {best_excl}) over {len(n_true):,} S1; "
+         f"per fold {', '.join(f'{v:.4f}' for v in per_fold.values())}; dense score only {dense_ref[1]:.4f}")
 
-    # final model on the whole sample with the early-stopped number of rounds
-    final = lgb.train(params, lgb.Dataset(df[features], df["label"]), model.best_iteration)
+    rounds = int(np.mean(best_iters) * 1.1)
+    final = lgb.train(PARAMS, lgb.Dataset(df[features], df["label"]), rounds)
     out = config.MODEL_DIR / run_id
     out.mkdir(parents=True, exist_ok=True)
     final.save_model(str(out / "model.txt"))
     imp = pd.Series(final.feature_importance("gain"), index=features).sort_values(ascending=False)
     imp.to_csv(out / "importance.csv")
-    meta = {"features": features, "threshold": best_t, "exclusive": best_excl, "holdout_f05": best_f,
-            "dense_only_f05": dense_ref[1], "rounds": model.best_iteration, "params": params,
-            "grid": results}
+    meta = {"features": features, "threshold": best_t, "exclusive": best_excl, "oof_f05": best_f,
+            "oof_f05_per_fold": per_fold, "dense_only_f05": dense_ref[1], "candidate_recall": float(found),
+            "fold_rounds": best_iters, "rounds": rounds, "params": PARAMS, "grid": results}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
-    _log(f"saved {out}; top features: {', '.join(imp.index[:8])}; total {time.time() - t0:.0f}s")
+    (out / "postprocess.json").write_text(json.dumps({"method": "threshold", "threshold": best_t,
+                                                      "exclusive": best_excl, "per_source": False}, indent=1))
+    _log(f"saved {out}; top features: {', '.join(imp.index[:10])}; total {time.time() - t0:.0f}s")
 
 
 # ------------------------------------------------------------------------------------------ submit
@@ -274,7 +348,8 @@ def submit(run_id: str) -> None:
     for batch in pf.iter_batches(batch_size=PAIR_CHUNK, columns=["s1_id", "cand_id"] + meta["features"]):
         b = batch.to_pandas()
         probs.append(pd.DataFrame({"s1_id": b["s1_id"], "cand_id": b["cand_id"],
-                                   "prob": model.predict(b[meta["features"]]).astype(np.float32)}))
+                                   "prob": model.predict(b[meta["features"]], num_threads=config.N_JOBS)
+                                   .astype(np.float32)}))
     preds = pd.concat(probs, ignore_index=True)
     preds.to_parquet(config.cache_path(f"preds/{run_id}_test.parquet"), index=False)
     sel = select(preds, meta["threshold"], meta["exclusive"])
@@ -294,13 +369,15 @@ def submit(run_id: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("step", choices=["text", "features", "train", "submit"])
+    parser.add_argument("step", choices=["text", "pairs", "features", "train", "submit"])
     parser.add_argument("--split", choices=["train", "test"])
     parser.add_argument("--run-id")
     args = parser.parse_args()
     if args.step == "text":
         for split in ([args.split] if args.split else config.SPLITS):
             build_text(split)
+    elif args.step == "pairs":
+        build_pairs(args.split)
     elif args.step == "features":
         build_features(args.split)
     elif args.step == "train":
