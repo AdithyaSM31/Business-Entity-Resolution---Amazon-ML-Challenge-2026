@@ -30,26 +30,65 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from . import config, io_utils
+from .normalize import dominant_script, non_latin_scripts
 
 DOC_PATH = config.ROOT / "docs" / "EDA.md"
 
-ID_PREFIX_LEN = 2                                  # "S1-" / "S2-" / "S3-" is always 3 characters
+ID_PREFIX_LEN = 3                                  # "S1-" / "S2-" / "S3-" is always 3 characters
 POSTCODE_RE = r"(?<!\d)\d{5,6}(?!\d)"             # standalone 5/6-digit run, not part of a longer number
 TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)     # word tokens; keeps Devanagari and Kannada intact
+FIRST_TOKEN_RE = r"^\s*(\S+)"                     # first whitespace token, junk such as ">>" included
 LENGTH_PCTS = (1, 25, 50, 75, 95, 99)
 COUNT_BUCKETS = (0, 1, 2, 3, 4)                   # digitize bucket 5 collects 5+
+NONASCII_RE = re.compile(r"[^\x00-\x7F]")          # gate for the non-Latin script pass
+TOP_FIRST_TOKENS = 30                              # most frequent name first tokens to list
+TOP_FIRST_TOKENS_TABLE = 40                        # rows in the transposed first-token table
+TOP_SCRIPTS = 8                                   # dominant scripts listed per file and country
+TOP_SCRIPT_SETS = 8                               # non-Latin script combinations listed likewise
 
 # One pass over the name column finds every noisy record; the categories are then counted on that
 # small subset, which keeps the whole catalogue to two extra full-column passes.
 NAME_NOISE_RE = re.compile(r"^[^\w]|www\.|https?:|\.(?:com|in|net|org|co|us|fr)\b|\bdba\b|trading as")
-LEADING_JUNK_RE = re.compile(r"^[^\w]")
+LEADING_JUNK_RE = re.compile(r"^[^\w]")           # a digit is \w, so it needs its own pattern
+LEADING_DIGIT_RE = re.compile(r"^\d")
 DOMAIN_RE = re.compile(r"www\.|https?:|\.(?:com|in|net|org|co|us|fr)\b")
 DBA_RE = re.compile(r"\bdba\b|trading as")
 HAS_DIGIT_RE = re.compile(r"\d")
 LOWER_RE = re.compile(r"[a-z]")
+UPPER_RE = re.compile(r"[A-Z\u00C0-\u00D6\u00D8-\u00DE]")   # cased uppercase only, accented Latin included
 LEADS_NUMBER_RE = re.compile(r"^\s*\d")
 FRENCH_BIS_RE = re.compile(r"\b(?:bis|ter|quater)\b", re.IGNORECASE)   # case-folded: BIs, Bis, BIS all occur
 NULL_PLACEHOLDER_RE = re.compile(r"<\s*null\s*>|\bnull\b|\bn/a\b", re.IGNORECASE)
+# Zero-width and bidi control characters. Invisible in every viewer, so they survive a naive
+# normalization and then break exact-match blocking, and they belong to no Unicode script.
+INVISIBLE_RE = re.compile(r"[\u00ad\u200b-\u200f\u2060\ufeff]")
+
+# Legal forms from all three countries, plus the Indian M/S and MSME spellings. Matched after any
+# run of punctuation, so '"M/S" TRADING' and '(P) LTD' count. Deliberately country-agnostic: this is
+# the shape of the normalize.py word map, not a classifier.
+LEGAL_WORDS = ("m/s", "s/s", "msme", "private", "pvt", "proprietorship", "partnership", "sasuru",
+               "sarl", "eurl", "sas", "sasu", "sca", "scs", "snc", "sci", "gmbh", "incorporated",
+               "corporation", "company", "limited", "plc", "pte", "pty", "llc", "inc", "ltd",
+               "corp", "llp", "sp", "sa", "co", "lp", "ab", "as", "bv", "nv", "oy")
+LEGAL_FIRST_RE = re.compile(r"^[^\w]*(?:" + "|".join(re.escape(w) for w in LEGAL_WORDS) + r")\b",
+                            re.IGNORECASE)
+
+# Landmark wording, for the is_landmark / landmark columns of normalize_address. "across from" is
+# kept because it is absent from train and may appear in test.
+LANDMARK_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("near / nearby", re.compile(r"\bnear(?:by)?\b", re.IGNORECASE)),
+    ("opposite / opp", re.compile(r"\bopposite\b|\bopp\b", re.IGNORECASE)),
+    ("behind", re.compile(r"\bbehind\b", re.IGNORECASE)),
+    ("beside / next to / adjacent to",
+     re.compile(r"\bbeside\b|\badjacent to\b|\bnext to\b", re.IGNORECASE)),
+    ("in front of", re.compile(r"\bin front of\b|\bfront of\b", re.IGNORECASE)),
+    ("across from", re.compile(r"\bacross (?:from|the street)\b", re.IGNORECASE)),
+    ("esquina / vista / frente", re.compile(r"\besquina\b|\bvista\b|\bfrente\b", re.IGNORECASE)),
+    ("corner of", re.compile(r"\bcorner\b", re.IGNORECASE)),
+    ("rear / back of", re.compile(r"\brear\b|\bback of\b|\bbackside\b", re.IGNORECASE)),
+)
+LANDMARK_ANY_RE = re.compile("|".join(f"(?:{p.pattern})" for _, p in LANDMARK_PATTERNS),
+                             re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- reporting
@@ -139,6 +178,14 @@ def profile_frame(df: pd.DataFrame) -> dict:
 
     noisy = names[names.str.contains(NAME_NOISE_RE)]
     n_noisy = len(noisy)
+    # "UPPERCASE" means every cased letter is uppercase. Requiring a cased uppercase letter as well
+    # keeps the empty address and the caseless scripts (Devanagari, Kannada, ...) out of the count.
+    name_up = names.str.contains(UPPER_RE) & ~names.str.contains(LOWER_RE)
+    addr_up = addrs.str.contains(UPPER_RE) & ~addrs.str.contains(LOWER_RE) & (addrs != "")
+    # One pass for the landmark union, then the per-marker breakdown on the ~3% of rows that matched.
+    # Ten separate full-column regex passes cost 5 minutes on one 5M-row file; this costs 40 seconds.
+    landmark_hit = addrs.str.contains(LANDMARK_ANY_RE)
+    landmark_rows = addrs[landmark_hit]
     out = {
         "rows": n_rows,
         "by_country": {str(k): int(v) for k, v in df["country"].value_counts().items()},
@@ -152,19 +199,62 @@ def profile_frame(df: pd.DataFrame) -> dict:
         "name_tokens_mean": float((names.str.count(r"\s+") + 1).mean()),
         "name_noise": {
             "any of the below": n_noisy,
-            "leading junk char (`<< `, `-- `, digit)": int(noisy.str.contains(LEADING_JUNK_RE).sum()),
+            "leading junk char (`<< `, `-- `)": int(noisy.str.contains(LEADING_JUNK_RE).sum()),
+            "leading digit (`7 Eleven`, `4 27 Solar`)": int(names.str.contains(LEADING_DIGIT_RE).sum()),
             "web domain / URL as name": int(noisy.str.contains(DOMAIN_RE).sum()),
             "DBA or trading-as marker": int(noisy.str.contains(DBA_RE).sum()),
             "single token": int((names.str.count(r"\s+") == 0).sum()),
             "contains a digit": int(names.str.contains(HAS_DIGIT_RE).sum()),
+            "UPPERCASE name (no lowercase letter)": int(name_up.sum()),
+            "first token is a legal word": int(names.str.contains(LEGAL_FIRST_RE).sum()),
+            "contains a zero-width char (U+200C ZWNJ)": int(names.str.contains(INVISIBLE_RE).sum()),
         },
         "addr_noise": {
-            "no lowercase letter (UPPERCASE address)": int((~addrs.str.contains(LOWER_RE)).sum()),
+            "UPPERCASE address (no lowercase letter)": int(addr_up.sum()),
             "starts with a number": int(addrs.str.contains(LEADS_NUMBER_RE).sum()),
             "bis / ter / quater": int(addrs.str.contains(FRENCH_BIS_RE).sum()),
             "literal <NULL> / NULL / N/A placeholder": int(addrs.str.contains(NULL_PLACEHOLDER_RE).sum()),
+            "any landmark wording": int(landmark_hit.sum()),
+            "contains a zero-width char (U+200C ZWNJ)": int(addrs.str.contains(INVISIBLE_RE).sum()),
         },
+        "landmarks": {label: int(landmark_rows.str.contains(rx).sum())
+                      for label, rx in LANDMARK_PATTERNS},
     }
+    # First token of every name, for the legal-form word list. extract() rather than split() so this
+    # builds one string per row instead of one list per row.
+    first = names.str.lower().str.extract(FIRST_TOKEN_RE, expand=False)
+    out["first_tokens"] = first.value_counts().head(TOP_FIRST_TOKENS).to_dict()
+    return out
+
+
+def script_block(df: pd.DataFrame) -> dict:
+    """Per country, the dominant script of name and address plus every non-Latin script present.
+
+    The dominant script alone is misleading here: '... THRISSUR, കേരളം' is dominant-LATIN but carries
+    MALAYALAM, and 36k test rows look like that, so the minority-script column is reported next to it.
+    """
+    countries = df["country"].to_numpy()
+    out: dict = {}
+    for field, column in (("name", "business_name"), ("addr", "business_address")):
+        text = df[column]
+        dom = pd.Series([dominant_script(v) for v in text], dtype=object)
+        dominant = dom.groupby(countries).value_counts().unstack(fill_value=0)
+        # Only the non-ASCII rows can carry a non-Latin script, which is 0% of S1 and ~15% of S2/S3.
+        non_ascii = text.str.contains(NONASCII_RE).to_numpy()
+        sets: Counter = Counter()
+        if non_ascii.any():
+            for country, value in zip(countries[non_ascii], text[non_ascii]):
+                found = non_latin_scripts(value)
+                if found:
+                    sets[(country, found)] += 1
+        grouped: dict = {}
+        for (country, scripts), n in sets.most_common():
+            grouped.setdefault(str(country), []).append((list(scripts), int(n)))
+        out[field] = {
+            "dominant": {str(c): {str(s): int(v) for s, v in row.items() if v}
+                         for c, row in dominant.iterrows()},
+            "non_latin": {c: v[:TOP_SCRIPT_SETS] for c, v in grouped.items()},
+        }
     return out
 
 
@@ -201,6 +291,8 @@ def scan_file(split: str, source: int, rep: Report, *, keep_ids: bool = False, f
     df = io_utils.read_source(split, source)
     out = {"stats": profile_frame(df), "label": f"{split} S{source}"}
     out["stats"]["label"] = out["label"]
+    rep.progress(f"script inventory for {split} S{source} ...")
+    out["scripts"] = script_block(df)
     if france:
         out["france"] = france_block(df, n_france, top, seed)
     if keep_ids:
@@ -240,6 +332,12 @@ def build_pairs(gt: pd.DataFrame, rep: Report) -> dict:
     rep.progress(f"parsing the numeric id parts of {n_pairs} pairs ...")
     s1_num = pd.Series(s1_ids).str.slice(ID_PREFIX_LEN).astype("int64").to_numpy()
     cand_ids = np.asarray(list(itertools.chain.from_iterable(match_lists)), dtype=object)
+    # ID_PREFIX_LEN is 3 for "S1-"/"S2-"/"S3-". Fail loudly rather than silently slicing a
+    # character off a number, or a leading minus sign, if the id format ever changes.
+    bad = pd.Series(cand_ids).str.slice(0, ID_PREFIX_LEN)
+    prefixes = set(bad.unique())
+    if not prefixes <= {f"S{n}-" for n in (1, 2, 3)}:
+        raise ValueError(f"unexpected candidate id prefix in {sorted(prefixes)[:5]}")
     cand_num = pd.Series(cand_ids).str.slice(ID_PREFIX_LEN).astype("int64").to_numpy()
     return {"s1_ids": s1_ids, "lens": lens, "n_s1": n_s1, "n_pairs": n_pairs,
             "pair_s1_id": np.repeat(s1_ids, lens), "pair_cand_id": cand_ids,
@@ -512,6 +610,51 @@ def answer_h(rep: Report, pairs: dict, link: dict) -> None:
              "`fn_*` / `fa_*` feature files may depend on them.")
 
 
+def answer_scripts(rep: Report, scripts: dict) -> None:
+    """Script inventory per split x source x country (the normalize.py primitives, measured)."""
+    ordered = [(s, src) for s in config.SPLITS for src in config.SOURCES]
+    rep.h2("Unicode script of name and address, per split x source x country")
+    rep.note("A first pass over both text columns with `normalize.dominant_script()`. Source 1 is the "
+             "reference side: it is 100% Latin in train, so every other script has to be transliterated "
+             "*into* Latin before an S1 name can be compared with it.")
+    for field, column in (("name", "business_name"), ("addr", "business_address")):
+        rep.note(f"Dominant script of `{column}`, share within its file x country group. `EMPTY` is a "
+                 f"blank field, `OTHER` is digits and punctuation with no letter at all.")
+        rows = []
+        for split, source in ordered:
+            dominant = scripts[(split, source)][field]["dominant"]
+            for country, counts in sorted(dominant.items(), key=lambda kv: -sum(kv[1].values())):
+                n_group = sum(counts.values())
+                top = sorted(counts.items(), key=lambda kv: -kv[1])[:TOP_SCRIPTS]
+                for script, n in top:
+                    rows.append([f"{split} S{source}", country, script, n, _pct(n, n_group)])
+                shown = sum(v for _, v in top)
+                if shown < n_group:
+                    rows.append([f"{split} S{source}", country,
+                                 f"other {len(counts) - len(top)} scripts", n_group - shown,
+                                 _pct(n_group - shown, n_group)])
+        rep.table(["file", "country", "dominant script", "records", "share of group"], rows)
+
+    rep.note("Non-Latin scripts **present**, whether or not they dominate. This is the column that "
+             "keeps the bilingual rows visible: a dominant-script count alone reports MALAYALAM as "
+             "~0% of the addresses while ~36k test rows end in ', കേരളം'.")
+    rows = []
+    for split, source in ordered:
+        for field, column in (("name", "business_name"), ("addr", "business_address")):
+            dominant = scripts[(split, source)][field]["dominant"]
+            for country, sets in sorted(scripts[(split, source)][field]["non_latin"].items()):
+                n_group = sum(dominant[country].values())
+                for combo, n in sets:
+                    rows.append([f"{split} S{source}", column, country, " + ".join(combo), n,
+                                 _pct(n, n_group)])
+    rep.table(["file", "field", "country", "non-Latin scripts present", "records", "share of group"], rows)
+    rep.note("Consequence for BH-2 / BH-5: lowercasing, accent folding, punctuation removal and every "
+             "word-level comparison may only be applied to Latin text. A Latin-only normalizer turns "
+             "the Devanagari S2/S3 names into empty keys, so `name_latin` (transliteration) is a "
+             "requirement, not an optimisation, and the fold table in `normalize.py` is restricted to "
+             "Latin code points for that reason.")
+
+
 def answer_extra(rep: Report, stats: dict) -> None:
     rep.h2("Field quality, lengths and postcode-like numbers over all six files")
     ordered = [stats[(s, src)] for s in config.SPLITS for src in config.SOURCES]
@@ -543,11 +686,34 @@ def answer_extra(rep: Report, stats: dict) -> None:
     rep.table(["file", "records"] + addr_keys,
               [[st["label"], st["rows"]] + [f"{st['addr_noise'][k]:,} ({_pct(st['addr_noise'][k], st['rows'])})"
                                             for k in addr_keys] for st in ordered])
-    rep.note("So the normalizer needs: leading-junk stripping, a DBA / trading-as split, legal-form "
-             "classes, UPPERCASE folding, address component reordering, a number tokenizer that keeps "
-             "`5 bis rue ...` together, a postcode extractor, and a `<NULL>` / `N/A` placeholder to "
-             "delete. Note the asymmetry: S2 addresses are mostly UPPERCASE while S3 addresses are "
-             "mostly title case, so case folding has to happen before any token comparison.")
+    rep.note("Which landmark wording, per marker. `is_landmark` and `landmark` are single columns, so "
+             "the wording has to be bucketed rather than stored verbatim:")
+    rep.table(["file", "records"] + [label for label, _ in LANDMARK_PATTERNS],
+              [[st["label"], st["rows"]] + [f"{st['landmarks'][label]:,} "
+                                           f"({_pct(st['landmarks'][label], st['rows'])})"
+                                            for label, _ in LANDMARK_PATTERNS] for st in ordered])
+    rep.note("Most frequent first token of `business_name`. One row per token, so the columns line up "
+             "across the six files. Two things to read off it: the junk tokens `>>`, `***`, `--` and "
+             "`...` each appear ~15k times, which is what makes leading-junk stripping a real step "
+             "rather than a nicety; and the head of the list is brand words, not legal forms, so "
+             "`LEGAL_WORDS` has to stay a word map and not a prefix rule:")
+    token_files = [(st["label"], st["first_tokens"]) for st in ordered]
+    tokens = {t for _, counts in token_files for t in counts}
+    tokens = sorted(tokens, key=lambda t: -sum(c.get(t, 0) for _, c in token_files))
+    rep.table(["first token"] + [label for label, _ in token_files],
+              [[f"`{t}`"] + [c.get(t, 0) for _, c in token_files] for t in tokens[:TOP_FIRST_TOKENS_TABLE]])
+    rep.note("So the normalizer needs: leading-junk stripping (punctuation **and** a leading digit), a "
+             "DBA / trading-as split, legal-form classes, UPPERCASE folding, address component "
+             "reordering, a number tokenizer that keeps `5 bis rue ...` together, a postcode "
+             "extractor, and a `<NULL>` / `N/A` placeholder to delete. Note the asymmetry: S2 "
+             "addresses are mostly UPPERCASE while S3 addresses are mostly title case, so case "
+             "folding has to happen before any token comparison - and neither case is a script "
+             "signal, see the inventory above.")
+    rep.note("The zero-width count is a blocking hazard, not a typo: U+200C is legitimate inside "
+             "Indic text but is invisible in every viewer, so two records that differ only by it "
+             "are byte-identical to a human and unequal to a hash. It has to be deleted before any "
+             "exact-match key, and it is also why the script table deletes unmapped code points "
+             "instead of failing on them.")
 
 
 # --------------------------------------------------------------------------- driver
@@ -571,11 +737,13 @@ def run_checks(write: bool = True, n_pairs: int = 25, n_france: int = 40, top: i
     s1: dict = {}
     pools: dict = {}
     france: dict = {}
+    scripts: dict = {}
     for split in config.SPLITS:
         for source in config.SOURCES:
             blk = scan_file(split, source, rep, keep_ids=(split == "train"),
                             france=(split == "test"), n_france=n_france, top=top, seed=seed)
             stats[(split, source)] = blk["stats"]
+            scripts[(split, source)] = blk["scripts"]
             if split == "test":
                 france[source] = blk["france"]
             elif source == 1:
@@ -610,6 +778,7 @@ def run_checks(write: bool = True, n_pairs: int = 25, n_france: int = 40, top: i
     answer_f(rep, pairs, link, s1, n_pairs, seed)
     answer_g(rep, france)
     answer_h(rep, pairs, link)
+    answer_scripts(rep, scripts)
     answer_extra(rep, stats)
 
     if write:
