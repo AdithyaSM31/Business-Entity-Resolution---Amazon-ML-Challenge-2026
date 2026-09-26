@@ -28,24 +28,21 @@ from . import io_utils
 # Constants
 # ---------------------------------------------------------------------------
 
-PASSES = ("tfidf_name", "tfidf_full", "rare_token", "addr_key", "dense", "reverse")
+PASSES = ("dense", "exact_name", "rare_token", "addr_key", "tfidf_name", "tfidf_full", "reverse")
+ALL_PASSES = PASSES
+DEFAULT_PASSES = ("dense", "exact_name", "rare_token", "addr_key")
 
-# K nearest neighbours to retrieve per S1 per target source per country
-TFIDF_K = 20
-
-# Number of S1 rows to process per cosine-similarity chunk (keeps RAM bounded)
-CHUNK_SIZE = 2_000
-
-
-# Rare-token inverted-index: a name_core token is "rare" if it appears in at
-# most this many documents across the whole split (all sources, all countries).
-RARE_DF_THRESH = 20
-
-# addr_key and rare_token caps (per S1, per target source, per country)
+# Default caps per S1 per target source
+EXACT_NAME_CAP = 30
 ADDR_KEY_CAP  = 30
 RARE_TOKEN_CAP = 30
 
-# reverse pass: how many top S1 to pull per target record
+# Rare-token inverted-index threshold
+RARE_DF_THRESH = 20
+
+# Optional TF-IDF passes constants (opt-in via --passes)
+TFIDF_K = 20
+CHUNK_SIZE = 2_000
 REVERSE_K = 5
 
 
@@ -441,260 +438,259 @@ def _run_tfidf_full(
 
 
 # ---------------------------------------------------------------------------
-# Pass: rare_token (SI-3)
+# Pass: exact_name (SI-3 / v1)
+# ---------------------------------------------------------------------------
+
+def _run_exact_name(
+    split: str,
+    records: pd.DataFrame,
+    s1_active: pd.DataFrame,
+    cap: int = EXACT_NAME_CAP,
+) -> pd.DataFrame:
+    """Exact-match blocking on normalized business name (name_core).
+
+    Matches S1 against target pools (sources 2 and 3) on exact name_core,
+    partitioned by country. Fully vectorized with pandas merges.
+    Capped at `cap` candidates per S1 per target source. Score = 1.0.
+    Returns DataFrame[s1_id, cand_id, cand_source, bs_exact_name, blk_exact_name].
+    """
+    t0 = time.perf_counter()
+    s1_valid = s1_active[s1_active["name_core"].str.strip() != ""][
+        ["entity_id", "country", "name_core"]
+    ].rename(columns={"entity_id": "s1_id"})
+
+    all_pairs: list[pd.DataFrame] = []
+    for tgt_src in (2, 3):
+        pool = records[
+            (records["source"] == tgt_src) & (records["name_core"].str.strip() != "")
+        ][["entity_id", "country", "name_core"]].rename(columns={"entity_id": "cand_id"})
+
+        if len(s1_valid) == 0 or len(pool) == 0:
+            continue
+
+        merged = s1_valid.merge(pool, on=["country", "name_core"], how="inner")
+        if len(merged) == 0:
+            continue
+
+        if cap is not None:
+            merged["_rank"] = merged.groupby("s1_id").cumcount()
+            merged = merged[merged["_rank"] < cap].drop(columns=["_rank"])
+
+        merged["cand_source"] = np.int8(tgt_src)
+        merged["bs_exact_name"] = np.float32(1.0)
+        merged["blk_exact_name"] = True
+        all_pairs.append(
+            merged[["s1_id", "cand_id", "cand_source", "bs_exact_name", "blk_exact_name"]]
+        )
+
+    result = (
+        pd.concat(all_pairs, ignore_index=True).drop_duplicates(["s1_id", "cand_id"])
+        if all_pairs
+        else pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_exact_name", "blk_exact_name"])
+    )
+    elapsed = time.perf_counter() - t0
+    print(f"\n  [exact_name][{split}]  elapsed={elapsed:.1f}s  total_pairs={len(result):,}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pass: rare_token (SI-3 / vectorized)
 # ---------------------------------------------------------------------------
 
 def _run_rare_token(
     split: str,
     records: pd.DataFrame,
     s1_active: pd.DataFrame,
+    cap: int = RARE_TOKEN_CAP,
 ) -> pd.DataFrame:
-    """Inverted-index blocking on rare name_core tokens.
+    """Inverted-index blocking on rare name_core tokens (vectorized).
 
     A token is "rare" if its document frequency in the whole split is <= RARE_DF_THRESH.
     Tokens that are pure digits or <= 2 characters are skipped.
-    Score = max IDF of shared rare tokens.  Cap RARE_TOKEN_CAP per S1 per target source.
-    Returns DataFrame[s1_id, cand_id, cand_source, bs_rare_token].
+    Score = max IDF of shared rare tokens. Capped at `cap` per S1 per target source.
+    Vectorized: explodes token IDs and performs an inner merge on (country, token_id).
+    Returns DataFrame[s1_id, cand_id, cand_source, bs_rare_token, blk_rare_token].
     """
     import math
     t0 = time.perf_counter()
 
-    # --- Build per-split IDF (log((N+1)/(df+1)) + 1, sklearn convention) ---
-    # Tokenise on whitespace; skip digits-only and short tokens
     def _tokenise(text: str) -> list[str]:
-        return [
-            tok for tok in str(text).split()
-            if len(tok) > 2 and not tok.isdigit()
-        ]
+        return [tok for tok in str(text).split() if len(tok) > 2 and not tok.isdigit()]
 
-    N = len(records)  # total docs in this split
-    # Build document-frequency map
-    df_map: dict[str, int] = {}
-    for text in records["name_core"]:
-        for tok in set(_tokenise(text)):  # set: count each token once per doc
-            df_map[tok] = df_map.get(tok, 0) + 1
+    N = len(records)
+    rec_tokens = records["name_core"].apply(_tokenise)
+    token_counts = pd.Series([tok for toks in rec_tokens for tok in set(toks)]).value_counts()
+    rare_tokens = set(token_counts[token_counts <= RARE_DF_THRESH].index)
 
-    # IDF (sklearn smooth IDF)
     idf_map = {
-        tok: math.log((N + 1) / (df + 1)) + 1
-        for tok, df in df_map.items()
-        if df <= RARE_DF_THRESH
+        tok: math.log((N + 1) / (token_counts[tok] + 1)) + 1.0
+        for tok in rare_tokens
     }
-    rare_tokens = set(idf_map)
-    print(
-        f"  [rare_token] rare_tokens={len(rare_tokens):,}  active_s1={len(s1_active):,}"
+    print(f"  [rare_token] rare_tokens={len(rare_tokens):,}  active_s1={len(s1_active):,}")
+    if not rare_tokens:
+        return pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_rare_token", "blk_rare_token"])
+
+    tok_to_id = {tok: idx for idx, tok in enumerate(rare_tokens)}
+    tok_id_to_idf = np.array([idf_map[tok] for tok in rare_tokens], dtype=np.float32)
+
+    # Build exploded table for active S1
+    s1_rec = s1_active[["entity_id", "country", "name_core"]].copy()
+    s1_rec["toks"] = s1_rec["name_core"].apply(
+        lambda t: [tok_to_id[x] for x in _tokenise(t) if x in tok_to_id]
+    )
+    s1_exploded = s1_rec.explode("toks").dropna(subset=["toks"])
+    if len(s1_exploded) == 0:
+        return pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_rare_token", "blk_rare_token"])
+
+    s1_exploded["toks"] = s1_exploded["toks"].astype(np.int32)
+    s1_exploded = (
+        s1_exploded.rename(columns={"entity_id": "s1_id", "toks": "token_id"})[
+            ["s1_id", "country", "token_id"]
+        ].drop_duplicates()
     )
 
-    # Pre-tokenise all records; keep only rare tokens per doc
-    records = records.copy()
-    records["_rtoks"] = records["name_core"].apply(
-        lambda t: [tok for tok in _tokenise(t) if tok in rare_tokens]
-    )
-
-    countries = s1_active["country"].unique()
     all_pairs: list[pd.DataFrame] = []
-
-    for country in countries:
-        s1_cty = s1_active[s1_active["country"] == country]
-        if len(s1_cty) == 0:
-            continue
-        # Merge rare tokens into s1_cty
-        s1_cty = s1_cty.merge(
-            records[["entity_id", "_rtoks"]],
-            on="entity_id", how="left"
+    for tgt_src in (2, 3):
+        pool = records[records["source"] == tgt_src][["entity_id", "country", "name_core"]].copy()
+        pool["toks"] = pool["name_core"].apply(
+            lambda t: [tok_to_id[x] for x in _tokenise(t) if x in tok_to_id]
         )
-        s1_cty["_rtoks"] = s1_cty["_rtoks"].apply(lambda x: x if isinstance(x, list) else [])
+        pool_exploded = pool.explode("toks").dropna(subset=["toks"])
+        if len(pool_exploded) == 0:
+            continue
+        pool_exploded["toks"] = pool_exploded["toks"].astype(np.int32)
+        pool_exploded = (
+            pool_exploded.rename(columns={"entity_id": "cand_id", "toks": "token_id"})[
+                ["cand_id", "country", "token_id"]
+            ].drop_duplicates()
+        )
 
-        for tgt_src in (2, 3):
-            pool_cty = records[
-                (records["source"] == tgt_src) & (records["country"] == country)
-            ]
-            fallback = False
-            if len(pool_cty) == 0:
-                pool_cty = records[records["source"] == tgt_src]
-                fallback = True
-            if len(pool_cty) == 0:
-                continue
+        merged = s1_exploded.merge(pool_exploded, on=["country", "token_id"], how="inner")
+        if len(merged) == 0:
+            continue
 
-            # Build inverted index: token -> list of pool row indices
-            inv_idx: dict[str, list[int]] = {}
-            for idx, rtoks in enumerate(pool_cty["_rtoks"]):
-                for tok in rtoks:
-                    inv_idx.setdefault(tok, []).append(idx)
-            pool_ids = pool_cty["entity_id"].values
+        merged["score"] = tok_id_to_idf[merged["token_id"].values]
+        pair_scores = merged.groupby(["s1_id", "cand_id"], as_index=False)["score"].max()
 
-            rows_out, cols_out, sc_out = [], [], []
-            for s1_idx, row in enumerate(s1_cty.itertuples(index=False)):
-                rtoks = row._rtoks  # pylint: disable=protected-access
-                if not rtoks:
-                    continue
-                # Accumulate max-IDF per matched pool record
-                hit_score: dict[int, float] = {}
-                for tok in rtoks:
-                    idf_val = idf_map.get(tok, 0.0)
-                    for pool_idx in inv_idx.get(tok, []):
-                        if hit_score.get(pool_idx, 0.0) < idf_val:
-                            hit_score[pool_idx] = idf_val
-                if not hit_score:
-                    continue
-                # Top-cap by score
-                items = sorted(hit_score.items(), key=lambda kv: -kv[1])[:RARE_TOKEN_CAP]
-                for pool_idx, sc in items:
-                    rows_out.append(s1_idx)
-                    cols_out.append(pool_idx)
-                    sc_out.append(sc)
+        pair_scores = pair_scores.sort_values(["s1_id", "score"], ascending=[True, False])
+        pair_scores["_rank"] = pair_scores.groupby("s1_id").cumcount()
+        pair_scores = pair_scores[pair_scores["_rank"] < cap].drop(columns=["_rank"])
 
-            if not rows_out:
-                continue
-            s1_id_arr = s1_cty["entity_id"].values
-            pairs = pd.DataFrame({
-                "s1_id":       s1_id_arr[rows_out],
-                "cand_id":     pool_ids[cols_out],
-                "cand_source": np.int8(tgt_src),
-                "bs_rare_token": np.array(sc_out, dtype=np.float32),
-            })
-            all_pairs.append(pairs)
-            mean_c = len(pairs) / len(s1_cty)
-            print(
-                f"    {country:30s}  src->{tgt_src}  "
-                f"s1={len(s1_cty):>7,}  pool={len(pool_cty):>8,}"
-                f"{'(fallback)' if fallback else '':10s}  "
-                f"pairs={len(pairs):>8,}  mean/s1={mean_c:.1f}"
-            )
+        pair_scores["cand_source"] = np.int8(tgt_src)
+        pair_scores["bs_rare_token"] = pair_scores["score"].astype(np.float32)
+        pair_scores["blk_rare_token"] = True
+        all_pairs.append(
+            pair_scores[["s1_id", "cand_id", "cand_source", "bs_rare_token", "blk_rare_token"]]
+        )
 
-    elapsed = time.perf_counter() - t0
     result = (
         pd.concat(all_pairs, ignore_index=True).drop_duplicates(["s1_id", "cand_id"])
         if all_pairs
-        else pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_rare_token"])
+        else pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_rare_token", "blk_rare_token"])
     )
+    elapsed = time.perf_counter() - t0
     print(f"\n  [rare_token][{split}]  elapsed={elapsed:.1f}s  total_pairs={len(result):,}")
-    result["blk_rare_token"] = True
     return result
 
 
 # ---------------------------------------------------------------------------
-# Pass: addr_key (SI-3)
+# Pass: addr_key (SI-3 / vectorized)
 # ---------------------------------------------------------------------------
 
 def _run_addr_key(
     split: str,
-    records: pd.DataFrame,   # must include postcode, addr_numbers, city, addr_norm
+    records: pd.DataFrame,
     s1_active: pd.DataFrame,
+    cap: int = ADDR_KEY_CAP,
 ) -> pd.DataFrame:
-    """Exact-match blocking on two address keys.
+    """Exact-match blocking on two address keys (vectorized).
 
-    Key A: (postcode, first addr_numbers entry) when both are non-empty.
-    Key B: (city, first addr_numbers entry, first addr_norm token) when all non-empty.
-    Cap ADDR_KEY_CAP per S1 per target source.  Score = 1.0 (match is boolean).
-    Returns DataFrame[s1_id, cand_id, cand_source, bs_addr_key].
+    Key A: (postcode, first addr_numbers entry) when both are non-empty. Score = 1.0.
+    Key B: (city, first addr_numbers entry, first addr_norm token) when all non-empty. Score = 0.8.
+    Capped at `cap` per S1 per target source.
+    Returns DataFrame[s1_id, cand_id, cand_source, bs_addr_key, blk_addr_key].
     """
     t0 = time.perf_counter()
 
     def _first(lst: list) -> str:
-        return lst[0] if lst else ""
+        return str(lst[0]).strip() if (isinstance(lst, list) and lst) else ""
 
     def _first_token(text: str) -> str:
-        toks = str(text).split()
+        toks = str(text).strip().split()
         return toks[0] if toks else ""
 
-    # Pre-compute keys for all records
-    records = records.copy()
-    records["_ak_a"] = [
-        (str(pc), str(fn))
-        for pc, an in zip(records["postcode"], records["addr_numbers"])
-        for fn in [_first(an) if isinstance(an, list) else ""]
-    ]
-    records["_ak_a"] = list(zip(
-        records["postcode"].astype(str),
-        records["addr_numbers"].apply(lambda x: _first(x) if isinstance(x, list) else ""),
-    ))
-    records["_ak_b"] = list(zip(
-        records["city"].astype(str),
-        records["addr_numbers"].apply(lambda x: _first(x) if isinstance(x, list) else ""),
-        records["addr_norm"].apply(_first_token),
-    ))
+    # Ensure necessary columns exist
+    for col in ["postcode", "city", "addr_norm"]:
+        if col not in records.columns:
+            records[col] = ""
+    if "addr_numbers" not in records.columns:
+        records["addr_numbers"] = [[] for _ in range(len(records))]
 
-    countries = s1_active["country"].unique()
+    pc = records["postcode"].astype(str).str.strip()
+    fn = records["addr_numbers"].apply(_first)
+    city = records["city"].astype(str).str.strip().str.lower()
+    stok = records["addr_norm"].apply(_first_token).str.lower()
+
+    has_a = (pc != "") & (fn != "")
+    has_b = (city != "") & (fn != "") & (stok != "")
+
+    key_a = (pc + "_" + fn).where(has_a, "")
+    key_b = (city + "_" + fn + "_" + stok).where(has_b, "")
+
+    records_keys = pd.DataFrame({
+        "entity_id": records["entity_id"],
+        "source": records["source"],
+        "country": records["country"],
+        "key_a": key_a,
+        "key_b": key_b,
+    })
+
+    s1_keys = s1_active[["entity_id", "country"]].merge(
+        records_keys[["entity_id", "key_a", "key_b"]], on="entity_id", how="left"
+    ).rename(columns={"entity_id": "s1_id"})
+
     all_pairs: list[pd.DataFrame] = []
-    print(f"  [addr_key]  active_s1={len(s1_active):,}")
+    for tgt_src in (2, 3):
+        pool_src = records_keys[records_keys["source"] == tgt_src].rename(
+            columns={"entity_id": "cand_id"}
+        )
 
-    for country in countries:
-        s1_cty = s1_active[s1_active["country"] == country]
-        if len(s1_cty) == 0:
+        # Match Key A
+        s1_a = s1_keys[s1_keys["key_a"] != ""][["s1_id", "country", "key_a"]]
+        pool_a = pool_src[pool_src["key_a"] != ""][["cand_id", "country", "key_a"]]
+        merged_a = s1_a.merge(pool_a, on=["country", "key_a"], how="inner")[["s1_id", "cand_id"]]
+        merged_a["score"] = np.float32(1.0)
+
+        # Match Key B
+        s1_b = s1_keys[s1_keys["key_b"] != ""][["s1_id", "country", "key_b"]]
+        pool_b = pool_src[pool_src["key_b"] != ""][["cand_id", "country", "key_b"]]
+        merged_b = s1_b.merge(pool_b, on=["country", "key_b"], how="inner")[["s1_id", "cand_id"]]
+        merged_b["score"] = np.float32(0.8)
+
+        combined = pd.concat([merged_a, merged_b], ignore_index=True)
+        if len(combined) == 0:
             continue
-        # Attach keys to s1
-        s1_keys = s1_cty.merge(records[["entity_id", "_ak_a", "_ak_b"]], on="entity_id", how="left")
 
-        for tgt_src in (2, 3):
-            pool_cty = records[
-                (records["source"] == tgt_src) & (records["country"] == country)
-            ]
-            fallback = False
-            if len(pool_cty) == 0:
-                pool_cty = records[records["source"] == tgt_src]
-                fallback = True
-            if len(pool_cty) == 0:
-                continue
+        combined = combined.sort_values(["s1_id", "score"], ascending=[True, False]).drop_duplicates(
+            ["s1_id", "cand_id"]
+        )
+        combined["_rank"] = combined.groupby("s1_id").cumcount()
+        combined = combined[combined["_rank"] < cap].drop(columns=["_rank"])
 
-            # Build inverted index for each key type
-            inv_a: dict[tuple, list[str]] = {}
-            inv_b: dict[tuple, list[str]] = {}
-            for row in pool_cty.itertuples(index=False):
-                ka = row._ak_a
-                kb = row._ak_b
-                if ka[0] and ka[1]:      # postcode + first-number both non-empty
-                    inv_a.setdefault(ka, []).append(row.entity_id)
-                if kb[0] and kb[1] and kb[2]:  # city + number + street-token all non-empty
-                    inv_b.setdefault(kb, []).append(row.entity_id)
+        combined["cand_source"] = np.int8(tgt_src)
+        combined["bs_addr_key"] = combined["score"].astype(np.float32)
+        combined["blk_addr_key"] = True
+        all_pairs.append(
+            combined[["s1_id", "cand_id", "cand_source", "bs_addr_key", "blk_addr_key"]]
+        )
 
-            hit_pairs: dict[tuple[str, str], float] = {}
-            for row in s1_keys.itertuples(index=False):
-                s1_id = row.entity_id
-                ka = row._ak_a
-                kb = row._ak_b
-                cands_hit: list[str] = []
-                if ka[0] and ka[1]:
-                    cands_hit.extend(inv_a.get(ka, []))
-                if kb[0] and kb[1] and kb[2]:
-                    cands_hit.extend(inv_b.get(kb, []))
-                # Deduplicate and cap
-                seen: set[str] = set()
-                count = 0
-                for cid in cands_hit:
-                    if cid not in seen:
-                        seen.add(cid)
-                        hit_pairs[(s1_id, cid)] = 1.0
-                        count += 1
-                        if count >= ADDR_KEY_CAP:
-                            break
-
-            if not hit_pairs:
-                continue
-            s_ids, c_ids, sc_s = zip(*[(s, c, v) for (s, c), v in hit_pairs.items()])
-            pairs = pd.DataFrame({
-                "s1_id":       list(s_ids),
-                "cand_id":     list(c_ids),
-                "cand_source": np.int8(tgt_src),
-                "bs_addr_key": np.array(sc_s, dtype=np.float32),
-            })
-            all_pairs.append(pairs)
-            mean_c = len(pairs) / len(s1_cty)
-            print(
-                f"    {country:30s}  src->{tgt_src}  "
-                f"s1={len(s1_cty):>7,}  pool={len(pool_cty):>8,}"
-                f"{'(fallback)' if fallback else '':10s}  "
-                f"pairs={len(pairs):>8,}  mean/s1={mean_c:.1f}"
-            )
-
-    elapsed = time.perf_counter() - t0
     result = (
         pd.concat(all_pairs, ignore_index=True).drop_duplicates(["s1_id", "cand_id"])
         if all_pairs
-        else pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_addr_key"])
+        else pd.DataFrame(columns=["s1_id", "cand_id", "cand_source", "bs_addr_key", "blk_addr_key"])
     )
+    elapsed = time.perf_counter() - t0
     print(f"\n  [addr_key][{split}]  elapsed={elapsed:.1f}s  total_pairs={len(result):,}")
-    result["blk_addr_key"] = True
     return result
 
 
@@ -993,6 +989,8 @@ def learned_prune(
     if split == "train":
         # Need ground truth labels
         gt_raw = io_utils.read_ground_truth()
+        if config.SAMPLE_FRAC < 1.0:
+            gt_raw = gt_raw[gt_raw["s1_id"].map(io_utils.in_dev_sample)].copy()
         gt_set: set[tuple[str, str]] = set()
         for row in gt_raw.itertuples(index=False):
             for m in row.matches:
@@ -1110,16 +1108,23 @@ def _roc_auc_simple(y_true: np.ndarray, y_score: np.ndarray) -> float:
 # Main entry-point: generate_candidates (SI-3 version)
 # ---------------------------------------------------------------------------
 
-def generate_candidates(split: str, top_n: int = 50) -> pd.DataFrame:
-    """Union all blocking passes, prune to top_n per S1, save candidates_{split}.parquet.
+def generate_candidates(
+    split: str,
+    top_n: int = 30,
+    passes: tuple[str, ...] | list[str] | None = None,
+) -> pd.DataFrame:
+    """Generate and prune candidates for *split*.
 
-    Implements all six passes (SI-1 + SI-3):
-      tfidf_name, tfidf_full, rare_token, addr_key, dense, reverse
-    prune_score is the max within-pass percentile rank across passes.
-    Pairs found by >= 3 passes are always kept regardless of top_n.
+    Default passes: dense, exact_name, rare_token, addr_key.
+    Optional passes (via passes arg): tfidf_name, tfidf_full, reverse.
     """
     t_total = time.perf_counter()
-    print(f"\n=== generate_candidates(split={split!r}, top_n={top_n}) ===")
+    if passes is None:
+        active_passes = list(DEFAULT_PASSES)
+    else:
+        active_passes = [p for p in passes if p in ALL_PASSES]
+
+    print(f"\n=== generate_candidates(split={split!r}, top_n={top_n}, passes={active_passes}) ===")
 
     records = _load_records_full(split)
     src_counts = records["source"].value_counts().sort_index().to_dict()
@@ -1133,45 +1138,59 @@ def generate_candidates(split: str, top_n: int = 50) -> pd.DataFrame:
         s1_active = s1_all.copy()
     print(f"  Active S1: {len(s1_active):,}  (SAMPLE_FRAC={config.SAMPLE_FRAC})")
 
-    # ---- Fit shared name vectoriser (used by tfidf_name AND reverse) ----
-    vect_name = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(3, 5), min_df=1, sublinear_tf=True
-    )
-    vect_name.fit(records["name_core"].values)
-    print(f"  Shared name TF-IDF vocab: {len(vect_name.vocabulary_):,}")
+    # Only fit TF-IDF vectoriser if any TF-IDF pass was explicitly requested
+    need_tfidf_vect = any(p in active_passes for p in ("tfidf_name", "tfidf_full", "reverse"))
+    vect_name = None
+    if need_tfidf_vect:
+        vect_name = TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(3, 5), min_df=1, sublinear_tf=True
+        )
+        vect_name.fit(records["name_core"].values)
+        print(f"  Shared name TF-IDF vocab: {len(vect_name.vocabulary_):,}")
 
-    # ---- Run all passes ----
     pass_dfs: list[pd.DataFrame] = []
 
-    # 1. tfidf_name (uses shared vectoriser)
-    print("\n-- Pass: tfidf_name --")
-    df_name = _run_tfidf_name_with_vect(split, records, s1_active, vect_name)
-    pass_dfs.append(df_name)
+    # 1. dense
+    if "dense" in active_passes:
+        print("\n-- Pass: dense --")
+        df_dense = _run_dense(split)
+        pass_dfs.append(df_dense)
 
-    # 2. tfidf_full
-    print("\n-- Pass: tfidf_full --")
-    df_full = _run_tfidf_full(split, records, s1_active, vect_name)
-    pass_dfs.append(df_full)
+    # 2. exact_name
+    if "exact_name" in active_passes:
+        print("\n-- Pass: exact_name --")
+        df_exact = _run_exact_name(split, records, s1_active)
+        pass_dfs.append(df_exact)
 
     # 3. rare_token
-    print("\n-- Pass: rare_token --")
-    df_rare = _run_rare_token(split, records, s1_active)
-    pass_dfs.append(df_rare)
+    if "rare_token" in active_passes:
+        print("\n-- Pass: rare_token --")
+        df_rare = _run_rare_token(split, records, s1_active)
+        pass_dfs.append(df_rare)
 
     # 4. addr_key
-    print("\n-- Pass: addr_key --")
-    df_addr = _run_addr_key(split, records, s1_active)
-    pass_dfs.append(df_addr)
+    if "addr_key" in active_passes:
+        print("\n-- Pass: addr_key --")
+        df_addr = _run_addr_key(split, records, s1_active)
+        pass_dfs.append(df_addr)
 
-    # 5. dense
-    print("\n-- Pass: dense --")
-    df_dense = _run_dense(split)
-    pass_dfs.append(df_dense)
+    # 5. tfidf_name (optional)
+    if "tfidf_name" in active_passes and vect_name is not None:
+        print("\n-- Pass: tfidf_name --")
+        df_name = _run_tfidf_name_with_vect(split, records, s1_active, vect_name)
+        pass_dfs.append(df_name)
 
-    # 6. reverse
-    print("\n-- Pass: reverse --")
-    df_rev = _run_reverse(split, records, s1_active, vect_name)
-    pass_dfs.append(df_rev)
+    # 6. tfidf_full (optional)
+    if "tfidf_full" in active_passes and vect_name is not None:
+        print("\n-- Pass: tfidf_full --")
+        df_full = _run_tfidf_full(split, records, s1_active, vect_name)
+        pass_dfs.append(df_full)
+
+    # 7. reverse (optional)
+    if "reverse" in active_passes and vect_name is not None:
+        print("\n-- Pass: reverse --")
+        df_rev = _run_reverse(split, records, s1_active, vect_name)
+        pass_dfs.append(df_rev)
 
     # ---- Union ----
     print("\n-- Union passes --")
@@ -1441,6 +1460,8 @@ def report(split: str = "train", top_n: int | None = None) -> dict:
 
     # Load ground truth
     gt_raw = io_utils.read_ground_truth()
+    if config.SAMPLE_FRAC < 1.0:
+        gt_raw = gt_raw[gt_raw["s1_id"].map(io_utils.in_dev_sample)].copy()
     truth  = dict(zip(gt_raw["s1_id"], gt_raw["matches"]))
     print(f"  Ground-truth: {len(truth):,} S1 entities, "
           f"{sum(len(v) for v in truth.values()):,} true pairs")
@@ -1608,6 +1629,8 @@ def misses_report(split: str = "train", examples: int = 10) -> pd.DataFrame:
 
     # Load ground truth
     gt_raw = io_utils.read_ground_truth()
+    if config.SAMPLE_FRAC < 1.0:
+        gt_raw = gt_raw[gt_raw["s1_id"].map(io_utils.in_dev_sample)].copy()
     gt_pairs: list[tuple[str, str]] = []
     for row in gt_raw.itertuples(index=False):
         for m in row.matches:
@@ -1897,8 +1920,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument(
-        "--top-n", type=int, default=50, dest="top_n",
-        help="Prune to this many candidates per S1 (default: 50).",
+        "--top-n", type=int, default=30, dest="top_n",
+        help="Prune to this many candidates per S1 (default: 30).",
+    )
+    parser.add_argument(
+        "--passes", nargs="+", default=None,
+        help="Which passes to run (e.g. dense exact_name rare_token addr_key). Default: dense exact_name rare_token addr_key.",
     )
     parser.add_argument(
         "--report", action="store_true",
@@ -1932,7 +1959,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not args.report_only:
-        generate_candidates(args.split, top_n=args.top_n)
+        generate_candidates(args.split, top_n=args.top_n, passes=args.passes)
 
     if args.learned_prune:
         learned_prune(args.split, top_n=args.top_n)
