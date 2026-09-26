@@ -921,6 +921,190 @@ def _prune(cands: pd.DataFrame, top_n: int, min_passes: int = 3) -> pd.DataFrame
 
     return cands
 
+# ---------------------------------------------------------------------------
+# SI-6 (1): Learned pruning
+# ---------------------------------------------------------------------------
+
+def learned_prune(
+    split: str = "train",
+    top_n: int = 50,
+    n_splits: int = 5,
+    min_passes: int = 3,
+) -> pd.DataFrame:
+    """Fit a LogisticRegression on blocking features to replace the heuristic prune_score.
+
+    Uses GroupKFold(n_splits) grouped by s1_id so no S1's candidates appear in
+    both train and validation folds.  The final prune_score written to the
+    parquet is the OOF probability on train; on test a single model is fit on
+    all train data and applied.
+
+    Features: bs_* filled with -1 when NaN, blk_* as 0/1, n_passes.
+    Target:   ground-truth label (1 = true match).
+
+    After fitting, re-prunes at the requested top_n with the new scores and
+    calls sweep_top_n() to compare recall.  Returns the updated candidates DF.
+
+    Parameters
+    ----------
+    split     : 'train' or 'test'
+    top_n     : number of candidates to keep per S1 after re-pruning
+    n_splits  : GroupKFold splits (train only)
+    min_passes: pairs found by >= min_passes are always kept (same as _prune)
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GroupKFold
+    from sklearn.preprocessing import StandardScaler
+
+    print(f"\n=== learned_prune(split={split!r}, top_n={top_n}) ===")
+
+    cands_path = config.cache_path(f"candidates_{split}.parquet")
+    if not cands_path.exists():
+        raise FileNotFoundError(
+            f"candidates_{split}.parquet not found – run generate_candidates first."
+        )
+    cands = pd.read_parquet(cands_path)
+    print(f"  Loaded {len(cands):,} candidate pairs")
+
+    bs_cols  = [f"bs_{p}"  for p in PASSES]
+    blk_cols = [f"blk_{p}" for p in PASSES]
+
+    # Build feature matrix
+    feat_parts = []
+    for col in bs_cols:
+        if col in cands.columns:
+            feat_parts.append(cands[col].fillna(-1.0).astype(np.float32).values.reshape(-1, 1))
+        else:
+            feat_parts.append(np.full((len(cands), 1), -1.0, dtype=np.float32))
+    for col in blk_cols:
+        if col in cands.columns:
+            feat_parts.append(cands[col].fillna(False).astype(np.float32).values.reshape(-1, 1))
+        else:
+            feat_parts.append(np.zeros((len(cands), 1), dtype=np.float32))
+    n_passes_vec = np.zeros((len(cands), 1), dtype=np.float32)
+    for col in blk_cols:
+        if col in cands.columns:
+            n_passes_vec[:, 0] += cands[col].fillna(False).astype(np.float32).values
+    feat_parts.append(n_passes_vec)
+
+    X = np.hstack(feat_parts)
+    feat_names = bs_cols + blk_cols + ["n_passes"]
+    print(f"  Feature matrix: {X.shape}")
+
+    if split == "train":
+        # Need ground truth labels
+        gt_raw = io_utils.read_ground_truth()
+        gt_set: set[tuple[str, str]] = set()
+        for row in gt_raw.itertuples(index=False):
+            for m in row.matches:
+                gt_set.add((row.s1_id, m))
+        y = np.array(
+            [1 if (s, c) in gt_set else 0
+             for s, c in zip(cands["s1_id"], cands["cand_id"])],
+            dtype=np.int8,
+        )
+        print(f"  Labels: {y.sum():,} positives / {len(y):,} total  "
+              f"({y.mean()*100:.2f}% positive rate)")
+
+        groups = cands["s1_id"].values
+        oof_prob = np.zeros(len(cands), dtype=np.float32)
+
+        gkf = GroupKFold(n_splits=n_splits)
+        for fold_i, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups)):
+            scaler = StandardScaler()
+            X_tr = scaler.fit_transform(X[tr_idx])
+            X_va = scaler.transform(X[va_idx])
+            clf = LogisticRegression(
+                max_iter=500, C=1.0, class_weight="balanced", solver="lbfgs"
+            )
+            clf.fit(X_tr, y[tr_idx])
+            oof_prob[va_idx] = clf.predict_proba(X_va)[:, 1]
+            va_auc = _roc_auc_simple(y[va_idx], oof_prob[va_idx])
+            print(f"  fold {fold_i+1}/{n_splits}  val_auc={va_auc:.4f}")
+
+        cands["prune_score"] = oof_prob.astype(np.float32)
+
+        # Also fit a final model on all data and save coefficients for test
+        scaler_all = StandardScaler()
+        X_all = scaler_all.fit_transform(X)
+        clf_all = LogisticRegression(
+            max_iter=500, C=1.0, class_weight="balanced", solver="lbfgs"
+        )
+        clf_all.fit(X_all, y)
+
+        # Persist model parameters for test-time use
+        import json
+        model_dir = config.cache_path("learned_prune")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_params = {
+            "coef": clf_all.coef_.tolist(),
+            "intercept": clf_all.intercept_.tolist(),
+            "scaler_mean": scaler_all.mean_.tolist(),
+            "scaler_scale": scaler_all.scale_.tolist(),
+            "feature_names": feat_names,
+        }
+        params_path = model_dir / "lr_params.json"
+        params_path.write_text(json.dumps(model_params, indent=2))
+        print(f"  Saved LR params -> {params_path}")
+
+        # Feature importances (absolute |coef|)
+        coef = np.abs(clf_all.coef_[0])
+        top_feat = sorted(zip(feat_names, coef), key=lambda x: -x[1])[:10]
+        print("\n  Top-10 features by |coef|:")
+        for fname, fcoef in top_feat:
+            print(f"    {fname:<20s}  {fcoef:.4f}")
+
+    else:  # split == 'test'
+        # Load model params fitted on train
+        import json
+        params_path = config.cache_path("learned_prune") / "lr_params.json"
+        if not params_path.exists():
+            raise FileNotFoundError(
+                f"{params_path} not found – run learned_prune('train') first."
+            )
+        mp = json.loads(params_path.read_text())
+        mean  = np.array(mp["scaler_mean"],  dtype=np.float32)
+        scale = np.array(mp["scaler_scale"], dtype=np.float32)
+        coef  = np.array(mp["coef"][0],      dtype=np.float32)
+        intercept = float(mp["intercept"][0])
+        X_scaled  = (X - mean) / scale
+        logit     = X_scaled @ coef + intercept
+        prob      = 1.0 / (1.0 + np.exp(-logit))
+        cands["prune_score"] = prob.astype(np.float32)
+
+    # Re-rank and re-prune
+    blk_cols_present = [c for c in blk_cols if c in cands.columns]
+    cands["_n_passes"] = cands[blk_cols_present].fillna(False).sum(axis=1)
+    cands["prune_rank"] = (
+        cands.groupby("s1_id")["prune_score"]
+        .rank(method="first", ascending=False)
+        .sub(1)
+        .astype(np.int16)
+    )
+    cands = cands[
+        (cands["prune_rank"] < top_n) | (cands["_n_passes"] >= min_passes)
+    ].drop(columns=["_n_passes"]).reset_index(drop=True)
+    print(f"\n  After learned prune (top_n={top_n}): {len(cands):,} pairs")
+
+    # Save updated candidates
+    cands.to_parquet(cands_path, index=False)
+    print(f"  Saved updated candidates -> {cands_path}")
+
+    # Re-run sweep if on train
+    if split == "train":
+        print("\n  Re-running sweep_top_n to compare recall after learned pruning:")
+        sweep_top_n(split)
+
+    return cands
+
+
+def _roc_auc_simple(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Compute ROC-AUC without scikit-learn dependency at call time."""
+    from sklearn.metrics import roc_auc_score
+    try:
+        return float(roc_auc_score(y_true, y_score))
+    except Exception:
+        return float("nan")
+
 
 # ---------------------------------------------------------------------------
 # Main entry-point: generate_candidates (SI-3 version)
@@ -1389,6 +1573,321 @@ def sweep_top_n(
 
 
 # ---------------------------------------------------------------------------
+# SI-6 (2): Missed pairs analysis
+# ---------------------------------------------------------------------------
+
+def misses_report(split: str = "train", examples: int = 10) -> pd.DataFrame:
+    """Analyse ground-truth pairs that NO blocking pass retrieved.
+
+    For each missed pair, loads the raw name_core, addr_norm, postcode, city
+    for both S1 and the target record, then groups misses into five categories:
+
+      1. name_very_different  – normalised edit-distance(name_core_s1, name_core_cand) > 0.6
+      2. address_only_match   – name very different but share a non-empty address key
+      3. empty_fields         – either side has empty name_core or empty addr_norm
+      4. cross_country        – s1 and cand have different country strings
+      5. other                – everything else
+
+    Prints counts and *examples* random examples per group.
+    Returns a DataFrame of all missed pairs with their group label.
+    """
+    if split != "train":
+        print("[misses_report] Ground truth only available for split='train'; skipping.")
+        return pd.DataFrame()
+
+    print(f"\n=== misses_report(split={split!r}) ===")
+
+    # Load candidates
+    cands_path = config.cache_path(f"candidates_{split}.parquet")
+    if not cands_path.exists():
+        raise FileNotFoundError(f"{cands_path} not found – run generate_candidates first.")
+    cand_pairs: set[tuple[str, str]] = set(
+        zip(*pd.read_parquet(cands_path, columns=["s1_id", "cand_id"]).values.T)
+    )
+    print(f"  Candidate pairs: {len(cand_pairs):,}")
+
+    # Load ground truth
+    gt_raw = io_utils.read_ground_truth()
+    gt_pairs: list[tuple[str, str]] = []
+    for row in gt_raw.itertuples(index=False):
+        for m in row.matches:
+            gt_pairs.append((row.s1_id, m))
+    print(f"  GT pairs: {len(gt_pairs):,}")
+
+    missed = [(s, c) for s, c in gt_pairs if (s, c) not in cand_pairs]
+    print(f"  Missed:   {len(missed):,}  ({len(missed)/len(gt_pairs)*100:.2f}% of GT)")
+    if not missed:
+        print("  No misses – blocking is perfect!")
+        return pd.DataFrame()
+
+    # Load records for context
+    recs_path = config.cache_path("records.parquet")
+    want = ["split", "source", "entity_id", "country",
+            "name_core", "addr_norm", "postcode", "city", "addr_numbers"]
+    if recs_path.exists():
+        import pyarrow.parquet as pq
+        avail = set(pq.read_schema(recs_path).names)
+        cols = [c for c in want if c in avail]
+        recs = pd.read_parquet(recs_path, columns=cols)
+        recs = recs[recs["split"] == split] if "split" in recs.columns else recs
+    else:
+        frames = []
+        for src in config.SOURCES:
+            raw = io_utils.read_source(split, src)
+            raw["name_core"] = raw["business_name"].str.lower().fillna("")
+            raw["source"] = src
+            frames.append(raw)
+        recs = pd.concat(frames, ignore_index=True)
+
+    for col in ["addr_norm", "postcode", "city", "country", "name_core"]:
+        if col not in recs.columns:
+            recs[col] = ""
+        else:
+            recs[col] = recs[col].fillna("").astype(str)
+
+    rec_idx = recs.set_index("entity_id")
+
+    # Build missed DataFrame
+    s1_ids  = [s for s, _ in missed]
+    cnd_ids = [c for _, c in missed]
+
+    def _get(col: str, ids: list[str]) -> list[str]:
+        return rec_idx[col].reindex(ids).fillna("").tolist()
+
+    df = pd.DataFrame({
+        "s1_id":         s1_ids,
+        "cand_id":       cnd_ids,
+        "country_s1":    _get("country",   s1_ids),
+        "country_cand":  _get("country",   cnd_ids),
+        "name_s1":       _get("name_core", s1_ids),
+        "name_cand":     _get("name_core", cnd_ids),
+        "addr_s1":       _get("addr_norm", s1_ids),
+        "addr_cand":     _get("addr_norm", cnd_ids),
+        "postcode_s1":   _get("postcode",  s1_ids),
+        "postcode_cand": _get("postcode",  cnd_ids),
+        "city_s1":       _get("city",      s1_ids),
+        "city_cand":     _get("city",      cnd_ids),
+    })
+
+    # Normalised edit distance (Levenshtein / max-len)
+    try:
+        from rapidfuzz.distance import Levenshtein
+        def _ned(a: str, b: str) -> float:
+            if not a and not b:
+                return 0.0
+            mx = max(len(a), len(b))
+            return Levenshtein.distance(a, b) / mx if mx else 0.0
+    except ImportError:
+        def _ned(a: str, b: str) -> float:  # type: ignore[misc]
+            if a == b:
+                return 0.0
+            if not a or not b:
+                return 1.0
+            # Cheap approximation: Jaccard on chars
+            sa, sb = set(a), set(b)
+            return 1.0 - len(sa & sb) / len(sa | sb)
+
+    df["ned_name"] = [
+        _ned(n1, n2) for n1, n2 in zip(df["name_s1"], df["name_cand"])
+    ]
+
+    def _shares_addr(row: pd.Series) -> bool:
+        """True if postcode matches and both are non-empty."""
+        return bool(row["postcode_s1"] and row["postcode_s1"] == row["postcode_cand"])
+
+    df["_shares_addr"] = df.apply(_shares_addr, axis=1)
+
+    NAME_DIFF_THRESH = 0.6
+
+    def _group(row: pd.Series) -> str:
+        if row["country_s1"] != row["country_cand"]:
+            return "cross_country"
+        if not row["name_s1"] or not row["name_cand"]:
+            return "empty_fields"
+        if row["ned_name"] > NAME_DIFF_THRESH:
+            if row["_shares_addr"]:
+                return "address_only_match"
+            return "name_very_different"
+        return "other"
+
+    df["group"] = df.apply(_group, axis=1)
+
+    # --- Print counts ---
+    sep = "=" * 72
+    print(f"\n{sep}")
+    print(f"  MISSED PAIR GROUPS  (total={len(df):,})")
+    print(sep)
+    counts = df["group"].value_counts()
+    for grp, cnt in counts.items():
+        print(f"  {grp:<25s}  {cnt:>7,}  ({cnt/len(df)*100:.1f}%)")
+    print(sep)
+
+    # --- Print examples ---
+    display_cols = ["s1_id", "cand_id", "country_s1", "country_cand",
+                    "name_s1", "name_cand", "addr_s1", "addr_cand", "ned_name"]
+    for grp in counts.index:
+        grp_df = df[df["group"] == grp]
+        sample = grp_df.sample(min(examples, len(grp_df)), random_state=42)
+        print(f"\n--- {grp}  (n={len(grp_df):,}, showing {len(sample)}) ---")
+        with pd.option_context("display.max_colwidth", 60, "display.width", 200):
+            print(sample[display_cols].to_string(index=False))
+
+    # Save to CSV for later inspection
+    out_path = config.ROOT / "docs" / "misses_report.csv"
+    df.drop(columns=["_shares_addr"]).to_csv(out_path, index=False)
+    print(f"\n  Full miss list -> {out_path}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# SI-6 (3): France / distribution shift report
+# ---------------------------------------------------------------------------
+
+def france_report(
+    split: str = "test",
+    countries: tuple[str, ...] = ("US", "India", "France"),
+) -> pd.DataFrame:
+    """Compare blocking quality across countries for a given split.
+
+    Prints, per country:
+      - Number of active S1s
+      - Mean / median / p95 candidates per S1
+      - Distribution of bs_tfidf_name for the BEST candidate per S1
+        (mean, p25, p50, p75, p95, fraction with score < 0.3)
+
+    Flags countries where the best-candidate score distribution looks shifted
+    (mean < 0.5 or > 20% with score < 0.3).
+
+    Parameters
+    ----------
+    split     : which split to analyse (default 'test')
+    countries : which country strings to highlight (others shown as 'other')
+    """
+    print(f"\n=== france_report(split={split!r}) ===")
+
+    cands_path = config.cache_path(f"candidates_{split}.parquet")
+    if not cands_path.exists():
+        raise FileNotFoundError(f"{cands_path} not found – run generate_candidates first.")
+
+    want_cols = ["s1_id", "cand_id"]
+    if "bs_tfidf_name" not in pd.read_parquet(cands_path, columns=["s1_id"]).columns:
+        # peek at actual columns
+        sample_df = pd.read_parquet(cands_path)
+        actual_cols = list(sample_df.columns)
+        del sample_df
+    else:
+        actual_cols = None
+
+    cands = pd.read_parquet(cands_path)
+    bs_col = "bs_tfidf_name" if "bs_tfidf_name" in cands.columns else None
+    print(f"  Loaded {len(cands):,} candidate pairs")
+
+    # Attach country from records
+    recs_path = config.cache_path("records.parquet")
+    if recs_path.exists():
+        import pyarrow.parquet as pq
+        avail = set(pq.read_schema(recs_path).names)
+        cols = [c for c in ["split", "source", "entity_id", "country"] if c in avail]
+        recs = pd.read_parquet(recs_path, columns=cols)
+        if "split" in recs.columns:
+            recs = recs[recs["split"] == split]
+        s1_country = (
+            recs[recs["source"] == 1][["entity_id", "country"]]
+            .rename(columns={"entity_id": "s1_id", "country": "_country"})
+        )
+    else:
+        raw_s1 = io_utils.read_source(split, 1)
+        s1_country = raw_s1[["entity_id", "country"]].rename(
+            columns={"entity_id": "s1_id", "country": "_country"}
+        )
+    cands = cands.merge(s1_country, on="s1_id", how="left")
+    cands["_country"] = cands["_country"].fillna("unknown")
+
+    # Best bs_tfidf_name per S1
+    if bs_col:
+        best_bs = (
+            cands.groupby("s1_id")[["_country", bs_col]]
+            .apply(lambda g: pd.Series({
+                "country": g["_country"].iloc[0],
+                "best_bs":  g[bs_col].max(),
+            }))
+            .reset_index()
+        )
+    else:
+        best_bs = (
+            cands.groupby("s1_id")["_country"]
+            .first()
+            .reset_index()
+            .rename(columns={"_country": "country"})
+        )
+        best_bs["best_bs"] = np.nan
+
+    n_cands_per_s1 = cands.groupby("s1_id")["cand_id"].count().rename("n_cands")
+    best_bs = best_bs.join(n_cands_per_s1, on="s1_id")
+
+    # Country bucketing
+    cty_set = set(countries)
+    best_bs["_cty_label"] = best_bs["country"].apply(
+        lambda c: c if c in cty_set else "other"
+    )
+
+    sep  = "-" * 80
+    sep2 = "=" * 80
+    print(f"\n{sep2}")
+    print(f"  DISTRIBUTION SHIFT REPORT  (split={split!r})")
+    print(f"{sep2}")
+    hdr = (f"  {'Country':<20} {'S1s':>8} {'mean_cands':>11} "
+           f"{'p50_cands':>10} {'p95_cands':>10} "
+           f"{'mean_bs':>8} {'p25_bs':>7} {'p50_bs':>7} "
+           f"{'p75_bs':>7} {'p95_bs':>7} {'<0.3':>6} {'FLAG':>5}")
+    print(hdr)
+    print(sep)
+
+    rows = []
+    # Print the requested countries first, then 'other'
+    labels_order = list(countries) + ["other"]
+    seen = set()
+    for label in labels_order:
+        if label in seen:
+            continue
+        seen.add(label)
+        grp = best_bs[best_bs["_cty_label"] == label]
+        if len(grp) == 0:
+            continue
+        n_s1       = len(grp)
+        mean_cands = grp["n_cands"].mean()
+        p50_cands  = grp["n_cands"].quantile(0.50)
+        p95_cands  = grp["n_cands"].quantile(0.95)
+        if bs_col and grp["best_bs"].notna().any():
+            mean_bs = grp["best_bs"].mean()
+            p25_bs  = grp["best_bs"].quantile(0.25)
+            p50_bs  = grp["best_bs"].quantile(0.50)
+            p75_bs  = grp["best_bs"].quantile(0.75)
+            p95_bs  = grp["best_bs"].quantile(0.95)
+            frac_low = (grp["best_bs"] < 0.3).mean()
+        else:
+            mean_bs = p25_bs = p50_bs = p75_bs = p95_bs = float("nan")
+            frac_low = float("nan")
+        flag = "(!)" if (mean_bs < 0.5 or frac_low > 0.20) else ""
+        print(
+            f"  {label:<20} {n_s1:>8,} {mean_cands:>11.1f} "
+            f"{p50_cands:>10.0f} {p95_cands:>10.0f} "
+            f"{mean_bs:>8.3f} {p25_bs:>7.3f} {p50_bs:>7.3f} "
+            f"{p75_bs:>7.3f} {p95_bs:>7.3f} "
+            f"{frac_low:>6.2f} {flag:>5}"
+        )
+        rows.append({
+            "country": label, "n_s1": n_s1,
+            "mean_cands": mean_cands, "p50_cands": p50_cands, "p95_cands": p95_cands,
+            "mean_bs": mean_bs, "p25_bs": p25_bs, "p50_bs": p50_bs,
+            "p75_bs": p75_bs, "p95_bs": p95_bs, "frac_low_bs": frac_low, "flag": flag,
+        })
+    print(sep2)
+    print("  NOTE: '(!)' = mean_bs < 0.5 or >20% of S1s have best-cand bs_tfidf_name < 0.3")
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1413,12 +1912,39 @@ if __name__ == "__main__":
         "--report-only", action="store_true", dest="report_only",
         help="Skip generation; only run report/sweep on existing candidates file.",
     )
+    # SI-6 flags
+    parser.add_argument(
+        "--learned-prune", action="store_true", dest="learned_prune",
+        help="(SI-6) Fit LR pruner on blocking features and re-prune (train only).",
+    )
+    parser.add_argument(
+        "--misses", action="store_true",
+        help="(SI-6) Print analysis of GT pairs not found by any pass (train only).",
+    )
+    parser.add_argument(
+        "--france", action="store_true",
+        help="(SI-6) Print per-country distribution-shift report.",
+    )
+    parser.add_argument(
+        "--france-split", default=None, dest="france_split",
+        help="Split to use for --france (default: same as --split).",
+    )
     args = parser.parse_args()
 
     if not args.report_only:
         generate_candidates(args.split, top_n=args.top_n)
 
+    if args.learned_prune:
+        learned_prune(args.split, top_n=args.top_n)
+
     if args.sweep:
         sweep_top_n(args.split)
     elif args.report:
         report(args.split, top_n=args.top_n)
+
+    if args.misses:
+        misses_report(args.split)
+
+    if args.france:
+        france_split = args.france_split or args.split
+        france_report(france_split)
