@@ -201,18 +201,23 @@ def _blocks(ids: pd.DataFrame) -> dict[tuple[int, str], np.ndarray]:
 
 
 def dense_neighbors(split: str, tag: str = DEFAULT_TAG, k: int = 10, k_reverse: int = 3,
-                    max_per_s1: int = 30) -> None:
+                    max_per_s1: int = 30, all_s1: bool = False) -> None:
     """Dense blocking pass: S1->S2 and S1->S3 top-k plus the reverse top-k_reverse, within country.
 
     Countries come from the data (open set). If a country has fewer than k target records, its S1
     records search the whole target pool of the split. The union is capped at max_per_s1 per S1.
+
+    all_s1=True searches with every train S1 (not just the dev sample) and writes
+    dense_neighbors_{split}_all.parquet. Train rows are still modelled on the sample only, but
+    competition features (how many S1s want this record, is this S1 its best) must see the same
+    full field of S1s on train as on test, or they are skewed about 5x on train.
     """
     emb, ids = load_embeddings(tag, split)
     blocks = _blocks(ids)
     entity = pa.array(ids["entity_id"].to_numpy())
 
     s1_rows = np.where(ids["source"].to_numpy() == 1)[0]
-    if split == "train" and config.SAMPLE_FRAC < 1:
+    if split == "train" and config.SAMPLE_FRAC < 1 and not all_s1:
         keep = np.fromiter((io_utils.in_dev_sample(e) for e in ids["entity_id"].to_numpy()[s1_rows]),
                            dtype=bool, count=len(s1_rows))
         s1_rows = s1_rows[keep]
@@ -252,11 +257,12 @@ def dense_neighbors(split: str, tag: str = DEFAULT_TAG, k: int = 10, k_reverse: 
     table = pa.table({"s1_id": entity.take(pa.array(pairs["q"].to_numpy())),
                       "cand_id": entity.take(pa.array(pairs["c"].to_numpy())),
                       "score": pa.array(pairs["score"].to_numpy())})
-    pq.write_table(table, config.cache_path(f"emb/dense_neighbors_{split}.parquet"))
+    suffix = "_all" if all_s1 and split == "train" else ""
+    pq.write_table(table, config.cache_path(f"emb/dense_neighbors_{split}{suffix}.parquet"))
     n_s1 = pairs["q"].nunique()
     _log(f"dense neighbors {split}: {n_s1:,} S1, {len(pairs):,} pairs, {len(pairs) / max(n_s1, 1):.1f} per S1, "
          f"{time.time() - t0:.0f}s")
-    if split == "train":
+    if split == "train" and not all_s1:  # the _all file is too big to score in memory, and is not a candidate set
         _report_recall(table.select(["s1_id", "cand_id"]).to_pandas(), set(ids["entity_id"].to_numpy()[s1_rows]))
 
 
@@ -321,13 +327,15 @@ if __name__ == "__main__":
     parser.add_argument("--k-reverse", type=int, default=3, help="S1 neighbours per S2/S3 record")
     parser.add_argument("--max-per-s1", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--all-s1", action="store_true",
+                        help="train only: search with every S1 and write dense_neighbors_train_all.parquet")
     args = parser.parse_args()
 
     if args.step in ("encode", "all"):
         encode_records(args.tag, args.model, args.views, args.batch_size)
     if args.step in ("neighbors", "all"):
-        for split in config.SPLITS:
-            dense_neighbors(split, args.tag, args.k, args.k_reverse, args.max_per_s1)
+        for split in (["train"] if args.all_s1 else config.SPLITS):
+            dense_neighbors(split, args.tag, args.k, args.k_reverse, args.max_per_s1, all_s1=args.all_s1)
     if args.step in ("features", "all"):
         for split in config.SPLITS:
             if config.cache_path(f"candidates_{split}.parquet").exists():
